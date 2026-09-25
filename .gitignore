@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+build/
+dist/
+Data/
+selftest_report.txt
+*.tmp
+*.tmp/
+assets/models/
+推送到GitHub.bat
+.zcode/
+.DS_Store
