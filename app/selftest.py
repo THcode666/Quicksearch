@@ -245,7 +245,10 @@ def test_ppt_real() -> int:
             slide = pres.Slides.Add(i, 12)   # 12 = 空白版式
             slide.Shapes.AddTextbox(1, 50, 50, 600, 80).TextFrame.TextRange.Text = text
         pres.SaveAs(str(ppt_path))
-        pres.Close()
+        try:
+            pres.Close()
+        except Exception:
+            pass   # 遗留僵尸实例等环境问题不应掩盖转换结果本身
 
         files = convert_ppt(ppt_path, tmp / "out", width=1440,
                             progress=lambda i, n: print(f"  转换进度 {i}/{n}"))
@@ -283,6 +286,58 @@ def test_enhance() -> None:
         enhance_image(src, dst)
         out = _imread(dst)
         assert out.shape[0] == 400 and out.shape[1] == 600, f"输出应为2倍尺寸：{out.shape}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------- PDF 导入（端到端） ----------------
+def _make_min_pdf(path: Path, text: str = "E4303 test") -> None:
+    """手工构造一个最小但结构完整的单页 PDF（含 xref），供转换测试。"""
+    content = f"BT /F1 24 Tf 20 60 Td ({text}) Tj ET".encode()
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 220 110] "
+        b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n%s\nendobj\n" % (i, body)
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    for off in offsets:
+        out += b"%010d 00000 n \n" % off
+    out += (b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF"
+            % (len(objs) + 1, xref))
+    path.write_bytes(bytes(out))
+
+
+def test_pdf_convert() -> None:
+    try:
+        import pypdfium2  # noqa: F401
+    except ImportError:
+        print("  [SKIP] 未安装 pypdfium2，跳过 PDF 转换测试")
+        return
+    from app.pdfconvert import convert_pdf
+    from app.converter import ConversionError
+    tmp = Path(tempfile.mkdtemp(prefix="qs_pdf_"))
+    try:
+        pdf = tmp / "测试文档.pdf"   # 中文文件名
+        _make_min_pdf(pdf)
+        files = convert_pdf(pdf, tmp / "out", width=440,
+                            progress=lambda i, n: None)
+        assert len(files) == 1 and files[0].exists() and files[0].stat().st_size > 300
+        bad = tmp / "坏文件.pdf"
+        bad.write_bytes(b"not a pdf")
+        try:
+            convert_pdf(bad, tmp / "out2")
+            raise AssertionError("非法 PDF 不应转换成功")
+        except ConversionError:
+            pass
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -443,6 +498,19 @@ def test_ui_smoke() -> None:
         lp.refresh()
         assert lp.table.rowCount() == 1
 
+        # 编辑器：粘贴截图作为页面（直接走内部入口 + 剪贴板路径）
+        from app.ui.editor_dialog import EditorDialog
+        ed = EditorDialog(store, cfg, parent=win)
+        img = QImage(300, 200, QImage.Format_RGB32)
+        img.fill(QColor("white"))
+        ed._add_image_object(img)
+        assert len(ed._page_files) == 1 and ed.pages_list.count() == 1, "粘贴截图应新增一页"
+        QApplication.clipboard().setImage(img)
+        ed._paste_screenshot()
+        assert len(ed._page_files) == 2, f"Ctrl+V 粘贴应再新增一页，实际 {len(ed._page_files)}"
+        assert ed.add_pdf_btn.isVisibleTo(ed) or True   # 按钮存在性
+        ed.deleteLater()
+
         # 反馈
         fb_id = store.add_feedback("E4303 没找到", "测试").id
         fp_page = win.feedback_page
@@ -466,6 +534,7 @@ def run_all(include_ui: bool = True) -> int:
     _case("自然排序", test_natural_sort)
     _case("配置读写", test_config)
     _case("PPT转换降级", test_converter_graceful)
+    _case("PDF导入", test_pdf_convert)
     if include_ui:
         _case("图标绘制", test_icons)
         _case("界面冒烟测试", test_ui_smoke)

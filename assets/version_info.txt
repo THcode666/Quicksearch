@@ -16,12 +16,12 @@ VSVersionInfo(
       StringTable('080404b0', [
         StringStruct('CompanyName', 'Quicksearch'),
         StringStruct('FileDescription', 'Quicksearch — 机台报警SOP快速查找'),
-        StringStruct('FileVersion', '1.1.0.0'),
+        StringStruct('FileVersion', '1.2.0.0'),
         StringStruct('InternalName', 'Quicksearch'),
         StringStruct('LegalCopyright', ''),
         StringStruct('OriginalFilename', 'Quicksearch.exe'),
         StringStruct('ProductName', 'Quicksearch'),
-        StringStruct('ProductVersion', '1.1.0.0')
+        StringStruct('ProductVersion', '1.2.0.0')
       ])
     ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])

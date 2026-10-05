@@ -39,11 +39,15 @@
 
 ### SOP 库（第二个模块）
 - **新建 SOP**：填名称、关联报警代码（可多个，如 E4303、E4305 共用一个 SOP）、解决方式说明；
-  页面支持"添加图片"（png/jpg/bmp 等，自动按文件名自然排序）或"添加PPT"。
+  页面支持"添加图片"（png/jpg/bmp 等，自动按文件名自然排序）、"添加PPT"、"添加PDF"、
+  "📋 粘贴截图"（Ctrl+V 直接把刚截的图/复制的图片文件变成一页）。
 - **添加PPT**：后台自动调用本机 PowerPoint/WPS 把每页转成 PNG（仅上传电脑需要装 Office，
   产线电脑不需要）。转换同时保留一份 PPT 原文件，查看时可一键用系统程序打开。
-  - PPT 可多次追加；页面支持上移/下移/移除。
+  - 自动兼容"受保护的视图"：从网络/微信下载的文件如被拦截，请右键→属性→解除锁定后重试；
+  - PPT/PDF 可多次追加；页面支持上移/下移/移除。
   - 转换失败（没装 Office）时提示改用"添加图片"。
+- **添加PDF**：用内置渲染组件（pypdfium2）把 PDF 每页转成图片，同样保留原 PDF，
+  无需安装任何 PDF 阅读器。
 - **编辑 / 删除**：选中列表中的 SOP 后操作；删除会同时清理页面文件（有确认提示）。
 - **排序**：按修改时间（新→旧 / 旧→新）或按名称（A→Z / Z→A，数字按自然序）。
 - **筛选**：输入关键词即时过滤名称/代码/解决方式。
@@ -159,15 +163,16 @@ tools\make_icon.py    生成 ico；tools\take_screens.py 界面截图预览
 ```bat
 git clone https://github.com/THcode666/Quicksearch.git
 cd Quicksearch
-pip install PySide6 pywin32 pyinstaller pillow opencv-contrib-python
+pip install PySide6 pywin32 pyinstaller pillow pypdfium2 opencv-contrib-python
 build.bat        rem 自动生成图标、下载超分模型、打包两个 exe 到 dist\
 ```
 
-自测：`python main.py --selftest`（11 项，含 3000 条 SOP 规模性能测试）。
+自测：`python main.py --selftest`（12 项，含 3000 条 SOP 规模性能测试与 PDF 导入端到端）。
 
 ## 八、致谢
 
 - [FSRCNN_Tensorflow](https://github.com/Saafke/FSRCNN_Tensorflow) — 高清修复所用 FSRCNN x2 超分模型（打包前由 `tools/download_model.py` 自动下载，仓库不直接附带模型文件）
+- [pypdfium2](https://github.com/pypdfium2/pypdfium2) — PDF 每页转图片（PDF 导入功能）
 - [OpenCV dnn_superres](https://docs.opencv.org/4.x/d1/dc0/tutorial_dnn_superres.html) — 超分推理
 - [PySide6（Qt6）](https://www.qt.io/)、[PyInstaller](https://pyinstaller.org/) — 界面与打包
 

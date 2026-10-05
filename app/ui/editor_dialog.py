@@ -55,21 +55,45 @@ class ConvertWorker(QThread):
         self._cancel = True
 
     def run(self) -> None:
-        canceled = {"flag": False}
-
-        def cancel_flag() -> bool:
-            return self._cancel
-
         try:
             files = convert_ppt(self.ppt_path, self.out_dir, self.width,
                                 progress=lambda i, n: self.prog.emit(i, n),
-                                cancel_flag=cancel_flag)
-            canceled["flag"] = self._cancel
-            self.done.emit([str(f) for f in files], canceled["flag"])
+                                cancel_flag=lambda: self._cancel)
+            self.done.emit([str(f) for f in files], self._cancel)
         except ConversionError as e:
             self.failed.emit(str(e))
         except Exception as e:   # COM 等底层错误统一包装
             self.failed.emit(f"转换失败：{e}")
+
+
+class PdfConvertWorker(QThread):
+    """后台把 PDF 逐页渲染为 PNG。"""
+
+    done = Signal(list, bool)
+    failed = Signal(str)
+    prog = Signal(int, int)
+
+    def __init__(self, pdf_path: Path, out_dir: Path, width: int, parent=None):
+        super().__init__(parent)
+        self.pdf_path = pdf_path
+        self.out_dir = out_dir
+        self.width = width
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        try:
+            from app.pdfconvert import convert_pdf
+            files = convert_pdf(self.pdf_path, self.out_dir, self.width,
+                                progress=lambda i, n: self.prog.emit(i, n),
+                                cancel_flag=lambda: self._cancel)
+            self.done.emit([str(f) for f in files], self._cancel)
+        except ConversionError as e:
+            self.failed.emit(str(e))
+        except Exception as e:
+            self.failed.emit(f"PDF 转换失败：{e}")
 
 
 class EditorDialog(QDialog):
@@ -133,10 +157,14 @@ class EditorDialog(QDialog):
         btns = QHBoxLayout()
         self.add_img_btn = QPushButton("添加图片…")
         self.add_ppt_btn = QPushButton("添加PPT…")
+        self.add_pdf_btn = QPushButton("添加PDF…")
+        self.paste_btn = QPushButton("📋 粘贴截图")
+        self.paste_btn.setToolTip("把刚截的图（PrintScreen/聊天工具截图）或复制的图片文件直接粘贴为页面 (Ctrl+V)")
         self.up_btn = QPushButton("上移")
         self.down_btn = QPushButton("下移")
         self.rm_btn = QPushButton("移除")
-        for b in (self.add_img_btn, self.add_ppt_btn, self.up_btn, self.down_btn, self.rm_btn):
+        for b in (self.add_img_btn, self.add_ppt_btn, self.add_pdf_btn,
+                  self.paste_btn, self.up_btn, self.down_btn, self.rm_btn):
             btns.addWidget(b)
         right.addLayout(btns)
 
@@ -147,8 +175,8 @@ class EditorDialog(QDialog):
         mid.addLayout(right, 1)
         root.addLayout(mid, 1)
 
-        tip = QLabel("提示：PPT 转换需要本机安装 PowerPoint 或 WPS（仅上传电脑需要）；"
-                     "转换失败时可把 PPT 手动导出为图片后“添加图片”。")
+        tip = QLabel("提示：PPT 转换需要本机安装 PowerPoint 或 WPS（仅上传电脑需要）；PDF 每页自动转图片；"
+                     "截图可直接 Ctrl+V 粘贴为页面；转换失败时可把文件手动导出为图片后“添加图片”。")
         tip.setObjectName("Muted")
         tip.setWordWrap(True)
         root.addWidget(tip)
@@ -171,9 +199,15 @@ class EditorDialog(QDialog):
         # ---- 信号 ----
         self.add_img_btn.clicked.connect(self._add_images)
         self.add_ppt_btn.clicked.connect(self._add_ppt)
+        self.add_pdf_btn.clicked.connect(self._add_pdf)
+        self.paste_btn.clicked.connect(self._paste_screenshot)
         self.up_btn.clicked.connect(lambda: self._move_page(-1))
         self.down_btn.clicked.connect(lambda: self._move_page(1))
         self.rm_btn.clicked.connect(self._remove_page)
+
+        from PySide6.QtGui import QKeySequence, QShortcut
+        sc = QShortcut(QKeySequence("Ctrl+V"), self)
+        sc.activated.connect(self._paste_screenshot)
 
         if sop:
             self._load_existing(sop)
@@ -257,30 +291,20 @@ class EditorDialog(QDialog):
             self._page_files.append(Path(f))
         self._refresh_pages()
 
-    def _add_ppt(self) -> None:
-        if self._worker is not None and self._worker.isRunning():
-            QMessageBox.information(self, "提示", "正在转换上一个 PPT，请稍候。")
-            return
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择 PPT 文件", "", "演示文稿 (*.pptx *.ppt);;所有文件 (*.*)")
-        if not path:
-            return
-        out = Path(self._tmpdir) / f"conv_{new_id()}"
-        out.mkdir(parents=True, exist_ok=True)
-        width = int(self.cfg.data.get("ppt_width", 1440) or 1440)
-
-        self._worker = ConvertWorker(Path(path), out, width, self)
-        dlg = QProgressDialog("正在转换 PPT（每页导出为图片）…", "取消", 0, 0, self)
-        dlg.setWindowTitle("PPT 转换")
+    def _wait_convert(self, worker: QThread, label: str) -> tuple[list, bool, str]:
+        """弹出进度条等一个转换线程跑完。返回 (文件列表, 是否取消, 错误信息)。"""
+        dlg = QProgressDialog(label, "取消", 0, 0, self)
+        dlg.setWindowTitle("转换")
         dlg.setWindowModality(Qt.WindowModal)
         dlg.setMinimumDuration(0)
         dlg.show()
 
-        state = {"files": None, "canceled": False, "err": ""}
+        state: dict = {"files": None, "canceled": False, "err": ""}
 
         def on_prog(i: int, n: int) -> None:
             dlg.setRange(0, n)
             dlg.setValue(i)
+            dlg.setLabelText(f"{label} 第 {i}/{n} 页")
 
         def on_done(files: list, canceled: bool) -> None:
             state["files"] = files
@@ -291,26 +315,24 @@ class EditorDialog(QDialog):
             state["err"] = msg
             dlg.reset()
 
-        self._worker.prog.connect(on_prog)
-        self._worker.done.connect(on_done)
-        self._worker.failed.connect(on_fail)
-        dlg.canceled.connect(self._worker.cancel)
-        self._worker.start()
+        worker.prog.connect(on_prog)
+        worker.done.connect(on_done)
+        worker.failed.connect(on_fail)
+        dlg.canceled.connect(worker.cancel)
+        worker.start()
         dlg.exec()
-        self._worker.wait()
-        self._worker.deleteLater()
-        self._worker = None
+        worker.wait()
+        worker.deleteLater()
+        return state["files"] or [], state["canceled"], state["err"]
 
-        if state["err"]:
-            QMessageBox.warning(
-                self, "转换失败", state["err"] +
-                "\n\n也可以把 PPT 每页另存为图片后，用“添加图片”导入。")
-            return
-        files = state["files"] or []
+    def _adopt_converted(self, path: Path, files: list, canceled: bool,
+                         keep_original: bool = True) -> None:
+        """把转换出的页面追加进列表（可选保留原文件）。"""
         if not files:
-            QMessageBox.warning(self, "转换失败", "没有转换出任何页面（可能 PPT 为空或被取消）。")
+            QMessageBox.warning(self, "转换失败",
+                                "没有转换出任何页面（可能文件为空或被取消）。")
             return
-        if state["canceled"]:
+        if canceled:
             if not (QMessageBox.question(
                     self, "已取消",
                     f"已转换 {len(files)} 页后取消。只使用已转换的页面吗？")
@@ -318,14 +340,98 @@ class EditorDialog(QDialog):
                 return
         self._page_files.extend(Path(f) for f in files)
         self._from_ppt_count += len(files)
-        orig_copy = Path(self._tmpdir) / f"orig_{new_id()}_{Path(path).name}"
-        try:
-            shutil.copyfile(path, orig_copy)
-            self._originals.append({"src": str(orig_copy), "name": Path(path).name,
-                                    "stored": None})
-        except OSError:
-            pass   # 原文件保留失败不影响主流程
+        if keep_original:
+            orig_copy = Path(self._tmpdir) / f"orig_{new_id()}_{Path(path).name}"
+            try:
+                shutil.copyfile(path, orig_copy)
+                self._originals.append({"src": str(orig_copy), "name": Path(path).name,
+                                        "stored": None})
+            except OSError:
+                pass   # 原文件保留失败不影响主流程
         self._refresh_pages()
+
+    def _add_ppt(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(self, "提示", "正在转换上一个文件，请稍候。")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择 PPT 文件", "", "演示文稿 (*.pptx *.ppt);;所有文件 (*.*)")
+        if not path:
+            return
+        out = Path(self._tmpdir) / f"conv_{new_id()}"
+        out.mkdir(parents=True, exist_ok=True)
+        width = int(self.cfg.data.get("ppt_width", 1440) or 1440)
+
+        self._worker = ConvertWorker(Path(path), out, width, self)
+        files, canceled, err = self._wait_convert(
+            self._worker, "正在转换 PPT（每页导出为图片）…")
+        self._worker = None
+        if err:
+            QMessageBox.warning(
+                self, "转换失败", err +
+                "\n\n也可以把 PPT 每页另存为图片后，用“添加图片”导入。")
+            return
+        self._adopt_converted(Path(path), files, canceled, keep_original=True)
+
+    def _add_pdf(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(self, "提示", "正在转换上一个文件，请稍候。")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择 PDF 文件", "", "PDF 文档 (*.pdf);;所有文件 (*.*)")
+        if not path:
+            return
+        out = Path(self._tmpdir) / f"pdf_{new_id()}"
+        out.mkdir(parents=True, exist_ok=True)
+        width = int(self.cfg.data.get("ppt_width", 1440) or 1440)
+
+        self._worker = PdfConvertWorker(Path(path), out, width, self)
+        files, canceled, err = self._wait_convert(
+            self._worker, "正在导入 PDF（每页转为图片）…")
+        self._worker = None
+        if err:
+            QMessageBox.warning(
+                self, "导入失败", err +
+                "\n\n也可以把 PDF 每页另存为图片后，用“添加图片”导入。")
+            return
+        self._adopt_converted(Path(path), files, canceled, keep_original=True)
+
+    def _add_image_object(self, img) -> None:
+        """把一张 QImage 保存为临时 png 并追加为页面（粘贴截图入口）。"""
+        fp = Path(self._tmpdir) / f"paste_{new_id()}.png"
+        if not img.save(str(fp)):
+            QMessageBox.warning(self, "提示", "截图保存失败，请重试。")
+            return
+        self._page_files.append(fp)
+        self._refresh_pages()
+        self.pages_list.setCurrentRow(len(self._page_files) - 1)
+
+    def _paste_screenshot(self) -> None:
+        """把剪贴板里的截图（或复制的图片文件）直接添加为一页。"""
+        from PySide6.QtWidgets import QApplication
+        cb = QApplication.clipboard()
+        md = cb.mimeData()
+        if md.hasImage():
+            img = cb.image()
+            if not img.isNull():
+                self._add_image_object(img)
+                return
+        if md.hasUrls():
+            from app.store import IMAGE_EXTS
+            for url in md.urls():
+                p = Path(url.toLocalFile())
+                if p.suffix.lower() in IMAGE_EXTS and p.exists():
+                    self._page_files.append(p)
+                    self._refresh_pages()
+                    self.pages_list.setCurrentRow(len(self._page_files) - 1)
+                    return
+            QMessageBox.information(self, "提示",
+                                    "剪贴板里复制的文件不是图片。\n请复制 png/jpg 图片文件，或先截图再粘贴。")
+            return
+        QMessageBox.information(
+            self, "提示",
+            "剪贴板里没有图片。\n请先截图（PrintScreen 或聊天工具截图），"
+            "或在资源管理器里复制图片文件后再点“粘贴截图”。")
 
     # ---------- 保存 ----------
     def _save(self) -> None:

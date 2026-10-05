@@ -11,6 +11,7 @@ a = Analysis(
         'win32com.client',
         'pythoncom',
         'pywintypes',
+        'pypdfium2',
     ],
     hookspath=[],
     hooksconfig={},
