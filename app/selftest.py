@@ -511,6 +511,35 @@ def test_ui_smoke() -> None:
         assert ed.add_pdf_btn.isVisibleTo(ed) or True   # 按钮存在性
         ed.deleteLater()
 
+        # 转换等待竞态回归：进度到最大值后 done 才入队，结果不能被误判为空
+        from PySide6.QtCore import QThread, Signal
+
+        class _FakeWorker(QThread):
+            done = Signal(list, bool)
+            failed = Signal(str)
+            prog = Signal(int, int)
+
+            def __init__(self):
+                super().__init__()
+                self._cancel = False
+
+            def cancel(self):
+                self._cancel = True
+
+            def run(self):
+                for i in range(1, 4):        # 模拟 3 页进度（最后一页触发自动关闭场景）
+                    self.prog.emit(i, 3)
+                    QThread.msleep(30)
+                self.done.emit(["p1.png", "p2.png", "p3.png"], False)
+
+        ed2 = EditorDialog(store, cfg, parent=win)
+        fw = _FakeWorker()
+        files, canceled, err = ed2._wait_convert(fw, "竞态测试")
+        assert files == ["p1.png", "p2.png", "p3.png"], \
+            f"done 结果不应丢失，实际 {files}（竞态回归）"
+        assert not err
+        ed2.deleteLater()
+
         # 反馈
         fb_id = store.add_feedback("E4303 没找到", "测试").id
         fp_page = win.feedback_page

@@ -86,6 +86,12 @@ def _try_open_with(progid: str, ppt_path: Path):
     """用指定组件尝试打开并确认页数；返回 (app, pres, total) 或 (None, None, 原因)。"""
     import win32com.client
     app = win32com.client.Dispatch(progid)
+    try:
+        # ppAlertsNone：自动化期间禁止 PowerPoint 弹模态提示——
+        # 否则打开损坏/受锁文件时的弹窗会永久阻塞后台转换线程
+        app.DisplayAlerts = 1
+    except Exception:
+        pass   # WPS 等组件可能不支持该属性
     pres = _open_presentation(app, ppt_path)
     total = _read_slide_count(pres)
     if total > 0:

@@ -292,11 +292,21 @@ class EditorDialog(QDialog):
         self._refresh_pages()
 
     def _wait_convert(self, worker: QThread, label: str) -> tuple[list, bool, str]:
-        """弹出进度条等一个转换线程跑完。返回 (文件列表, 是否取消, 错误信息)。"""
+        """弹出进度条等一个转换线程跑完。返回 (文件列表, 是否取消, 错误信息)。
+
+        关键点：QProgressDialog 默认在 setValue 到达最大值时**自动关闭**，
+        而"完成"信号是跨线程队列送达的——若对话框在信号送达前就退出事件循环，
+        会把成功结果误判为空（历史上表现为"没有转换出任何页面"）。
+        因此这里禁用自动关闭，在收到 done/failed 信号后再显式关闭，
+        并在退出后继续泵事件直到结果真正送达。
+        """
+        from PySide6.QtCore import QCoreApplication, QEventLoop
         dlg = QProgressDialog(label, "取消", 0, 0, self)
         dlg.setWindowTitle("转换")
         dlg.setWindowModality(Qt.WindowModal)
         dlg.setMinimumDuration(0)
+        dlg.setAutoReset(False)
+        dlg.setAutoClose(False)
         dlg.show()
 
         state: dict = {"files": None, "canceled": False, "err": ""}
@@ -309,11 +319,11 @@ class EditorDialog(QDialog):
         def on_done(files: list, canceled: bool) -> None:
             state["files"] = files
             state["canceled"] = canceled
-            dlg.reset()
+            dlg.accept()
 
         def on_fail(msg: str) -> None:
             state["err"] = msg
-            dlg.reset()
+            dlg.accept()
 
         worker.prog.connect(on_prog)
         worker.done.connect(on_done)
@@ -323,6 +333,11 @@ class EditorDialog(QDialog):
         dlg.exec()
         worker.wait()
         worker.deleteLater()
+        # 兜底：done 可能在线程退出后才入队（如用户取消），继续泵事件直到送达
+        spins = 0
+        while state["files"] is None and not state["err"] and spins < 250:
+            QCoreApplication.processEvents(QEventLoop.AllEvents, 20)
+            spins += 1
         return state["files"] or [], state["canceled"], state["err"]
 
     def _adopt_converted(self, path: Path, files: list, canceled: bool,
