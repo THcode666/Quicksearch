@@ -204,16 +204,26 @@ class Store:
         self.load_all()
 
     # ---------- 基础 ----------
-    def load_all(self) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+    def _load_sops(self) -> None:
         raw = load_json(self.sops_path, {"version": 1, "sops": []})
         self.sops = [Sop.from_dict(d) for d in raw.get("sops", [])]
+
+    def _load_feedback(self) -> None:
         raw = load_json(self.feedback_path, {"version": 1, "records": []})
         self.feedback = [Feedback.from_dict(d) for d in raw.get("records", [])]
+
+    def _load_search_logs(self) -> None:
         raw = load_json(self.searchlog_path, {"version": 1, "records": []})
         self.search_logs = [SearchLog.from_dict(d) for d in raw.get("records", [])]
 
+    def load_all(self) -> None:
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._load_sops()
+        self._load_feedback()
+        self._load_search_logs()
+
     def reload(self) -> None:
+        """从磁盘重读全部数据（多机共享时拉取其他电脑的最新内容）。"""
         self.load_all()
 
     def save_sops(self) -> None:
@@ -246,16 +256,31 @@ class Store:
         self.sops.append(sop)
         self.save_sops()
 
+    def upsert_sop(self, sop: Sop) -> None:
+        """按 id 更新或插入。先读盘取最新列表再做替换，保留其他电脑新增的 SOP，
+        避免多机维护时互相覆盖。"""
+        self._load_sops()
+        for i, s in enumerate(self.sops):
+            if s.id == sop.id:
+                self.sops[i] = sop
+                break
+        else:
+            self.sops.append(sop)
+        self.save_sops()
+
     def update_sop(self) -> None:
         self.save_sops()
 
     def delete_sop(self, sop_id: str) -> None:
+        self._load_sops()   # 以共享盘最新状态为基准删除
         self.sops = [s for s in self.sops if s.id != sop_id]
         self.save_sops()
         shutil.rmtree(self.media_dir(sop_id), ignore_errors=True)
 
     # ---------- 反馈 ----------
     def add_feedback(self, query: str, remark: str = "") -> Feedback:
+        """先读盘合并再追加：多台电脑同时提交反馈时互相保留。"""
+        self._load_feedback()
         fb = Feedback(query=query.strip(), remark=remark.strip(), status=STATUS_PENDING,
                       created_at=now_str())
         self.feedback.append(fb)
@@ -269,6 +294,7 @@ class Store:
         return None
 
     def set_feedback_status(self, fb_id: str, resolved: bool) -> None:
+        self._load_feedback()   # 以共享盘最新状态为基准，保留其他电脑的新反馈
         fb = self.get_feedback(fb_id)
         if fb:
             fb.status = STATUS_RESOLVED if resolved else STATUS_PENDING
@@ -276,17 +302,21 @@ class Store:
             self.save_feedback()
 
     def set_feedback_remark(self, fb_id: str, remark: str) -> None:
+        self._load_feedback()
         fb = self.get_feedback(fb_id)
         if fb is not None:
             fb.remark = remark.strip()
             self.save_feedback()
 
     def delete_feedback(self, fb_id: str) -> None:
+        self._load_feedback()
         self.feedback = [f for f in self.feedback if f.id != fb_id]
         self.save_feedback()
 
     # ---------- 搜索记录 ----------
     def add_search_log(self, query: str, found: bool) -> SearchLog:
+        """先读盘合并再追加：多台电脑同时搜索时，记录互相保留而不是整份覆盖。"""
+        self._load_search_logs()
         rec = SearchLog(query=query.strip(), found=found, time=now_str())
         self.search_logs.append(rec)
         self.save_search_logs()
@@ -294,6 +324,7 @@ class Store:
 
     def set_search_log_shot(self, log_id: str, src: Path) -> str:
         """把报错截图复制进数据目录（统一转存为 PNG 命名），返回相对路径。"""
+        self._load_search_logs()
         rec = next((r for r in self.search_logs if r.id == log_id), None)
         if rec is None:
             raise OSError(f"搜索记录不存在：{log_id}")
@@ -312,6 +343,7 @@ class Store:
         return p if p.exists() else None
 
     def delete_search_log(self, log_id: str) -> None:
+        self._load_search_logs()
         self.search_logs = [r for r in self.search_logs if r.id != log_id]
         self.save_search_logs()
         # 一并清理对应截图
@@ -325,6 +357,7 @@ class Store:
                     pass
 
     def clear_search_logs(self) -> None:
+        self._load_search_logs()
         self.search_logs = []
         self.save_search_logs()
         shutil.rmtree(self.data_dir / "shots", ignore_errors=True)

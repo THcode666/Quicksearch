@@ -274,6 +274,11 @@ class SearchPage(QWidget):
 
     # ---------- 正式搜索 ----------
     def _do_search(self) -> None:
+        # 搜索前重读共享数据：另一台电脑刚新增的 SOP 无需重启即可搜到
+        try:
+            self.store.reload()
+        except OSError:
+            pass   # 共享盘暂时不可达时用内存数据
         query = self.input.text().strip()
         self.result_list.clear()
         self._results = []

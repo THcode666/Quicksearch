@@ -110,8 +110,17 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.author_label)
 
     # ---------- 页面切换 ----------
+    def _reload_store(self) -> None:
+        """切页/打开SOP前从共享盘重读数据，另一台电脑的更新无需重启即可见。
+        共享盘暂时不可达时继续用内存数据，不打断操作。"""
+        try:
+            self.store.reload()
+        except OSError:
+            pass
+
     def show_page(self, index: int) -> None:
         """index: 0查找 1库 2反馈 3搜索记录"""
+        self._reload_store()
         if self.stack.currentWidget() is self.viewer_page:
             self._prev_page_index = index
         else:
@@ -127,12 +136,14 @@ class MainWindow(QMainWindow):
 
     def _back_from_viewer(self) -> None:
         idx = self._prev_page_index if 0 <= self._prev_page_index <= 3 else 0
+        self._reload_store()
         self.stack.setCurrentIndex(idx)
         widget = self.stack.widget(idx)
         if hasattr(widget, "refresh"):
             widget.refresh()
 
     def open_sop(self, sop_id: str) -> None:
+        self._reload_store()
         sop = self.store.get_sop(sop_id)
         if sop is None:
             from .common import warn

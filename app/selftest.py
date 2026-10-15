@@ -108,12 +108,42 @@ def test_store_roundtrip() -> None:
         shot_src.write_bytes(b"\x89PNG fake image")
         rel = st3.set_search_log_shot(rec.id, shot_src)
         assert rel == f"shots/{rec.id}.png", rel
-        assert st3.search_log_shot_path(rec) is not None
+        # 写入会重读共享盘，按 id 重新获取最新对象再断言
+        rec_fresh = next(r for r in st3.search_logs if r.id == rec.id)
+        assert st3.search_log_shot_path(rec_fresh) is not None
         st3.delete_search_log(rec.id)
         assert not (tmp / "数据目录" / "shots" / f"{rec.id}.png").exists(), "删记录应连带删截图"
 
         st3.clear_search_logs()
         assert st3.search_logs == []
+
+        # 多机场景：两个 Store 实例模拟两台电脑共用共享目录
+        from app.store import STATUS_RESOLVED as _RESOLVED
+        shared = tmp / "共享"
+        stA = Store(shared)
+        stB = Store(shared)
+        stA.add_search_log("E1", True)
+        stB.add_search_log("E2", False)
+        stA.add_search_log("E3", True)
+        assert [r.query for r in stA.search_logs] == ["E1", "E2", "E3"], \
+            f"他机的搜索记录不应被覆盖：{[r.query for r in stA.search_logs]}"
+        assert Store(shared).search_logs[-1].query == "E3"
+
+        fa = stA.add_feedback("反馈A")
+        stB.add_feedback("反馈B")
+        stA.set_feedback_status(fa.id, True)
+        rows = Store(shared).feedback
+        assert {f.query for f in rows} == {"反馈A", "反馈B"}, "他机的反馈不应被覆盖"
+        assert next(f for f in rows if f.query == "反馈A").status == _RESOLVED
+
+        sop_a = _sop("共享SOP-A", ["EA"])
+        stA.add_sop(sop_a)
+        stB.add_sop(_sop("共享SOP-B", ["EB"]))
+        sop_a.name = "共享SOP-A2"
+        stA.upsert_sop(sop_a)
+        chk = Store(shared)
+        assert chk.get_sop(sop_a.id).name == "共享SOP-A2"
+        assert any(s.name == "共享SOP-B" for s in chk.sops), "他机新增的SOP不应被覆盖"
 
         # 超上限自动丢弃最旧
         from app.store import SearchLog
@@ -356,6 +386,7 @@ def test_scale_performance() -> None:
         st.sops = [Sop(name=f"E{4000 + i} 报警{i} 处理SOP", alarm_codes=[f"E{4000 + i}"],
                        solution="检查模块供电并重新插拔模块，必要时更换备用模块并记录。")
                    for i in range(3000)]
+        st.save_sops()   # 落盘：搜索前会重读共享数据（多机同步行为）
         # 1) 纯搜索（3000 条全部参与打分，结果截取前 50）
         t0 = time.perf_counter()
         r = _search.search(st.sops, "模块")
@@ -466,6 +497,7 @@ def test_ui_smoke() -> None:
         dlg = ShotSubmitDialog(store, rec2.id, "E8888", win)
         dlg._set_image(QImage(str(photo)), photo)
         dlg._submit()
+        rec2 = next(r for r in store.search_logs if r.id == rec2.id)   # 重读后取最新对象
         assert rec2.shot == f"shots/{rec2.id}.jpg", f"照片应随记录保存: {rec2.shot}"
         assert store.search_log_shot_path(rec2) is not None
 
@@ -550,6 +582,25 @@ def test_ui_smoke() -> None:
         fp_page.status_filter.setCurrentText("待补充")
         fp_page.refresh()
         assert fp_page.table.rowCount() == 0, "已解决的记录不应出现在待补充筛选中"
+
+        # 多机同步（放在最后，不影响前面的行数断言）：
+        # 另一台电脑（另一个 Store 实例）新增 SOP / 产生记录，本机不重启即可见
+        from app.store import Store as OtherStore
+        other = OtherStore(win.store.data_dir)
+        other_sop = Sop(name="E9001 他机新增SOP", alarm_codes=["E9001"],
+                        solution="跨机同步验证", pages=["0001.png"])
+        other.add_sop(other_sop)
+        other.media_dir(other_sop.id).mkdir(parents=True, exist_ok=True)
+        QImage(240, 160, QImage.Format_RGB32).save(str(other.page_path(other_sop, 0)))
+        sp.input.setText("E9001")
+        sp._do_search()   # 搜索前自动重读共享数据
+        assert len(sp._results) == 1, "另一台电脑新增的SOP应无需重启即可搜到"
+        other.add_search_log("E9001", True)   # 他机产生的搜索记录
+        sp.input.setText("E9002XYZ")
+        sp._do_search()   # 未找到 → 本机自动记录
+        assert store.search_logs[-1].query == "E9002XYZ"
+        assert any(r.query == "E9001" and r.found for r in store.search_logs), \
+            "本机记录他机记录时应保留（合并而非覆盖）"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

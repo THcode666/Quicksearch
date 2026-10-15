@@ -485,10 +485,8 @@ class EditorDialog(QDialog):
             sop.source = "image"
         sop.updated_at = now_str()
 
-        if self.sop is None:
-            self.store.add_sop(sop)
-        else:
-            self.store.update_sop()
+        # 按id插入或更新：保存前重读共享盘，保留其他电脑同时新增的SOP
+        self.store.upsert_sop(sop)
         self.saved_id = sop.id
         self.accept()
 
