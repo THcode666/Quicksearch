@@ -412,8 +412,36 @@ def test_scale_performance() -> None:
         assert len(sp._results) == 50   # 上限 50 条
         assert len(st.search_logs) == 1
         assert t_page < 1.0, f"首页搜索耗时 {t_page:.3f}s 超标"
+        # 4) 搜索记录页：3000 条记录下刷新只渲染最近 500 条，且要快
+        from app.store import SearchLog
+        from app.ui.searchlog_page import SearchLogPage
+        st.search_logs = [SearchLog(query=f"E{i} 报警记录{i} 处理", found=(i % 3 != 0))
+                          for i in range(3000)]
+        st.save_search_logs()
+        slp = SearchLogPage(st)
+        t0 = time.perf_counter()
+        slp.refresh()
+        t_slp = time.perf_counter() - t0
+        assert slp.table.rowCount() == SearchLogPage.MAX_RENDER, \
+            f"应只渲染最近 {SearchLogPage.MAX_RENDER} 条，实际 {slp.table.rowCount()}"
+        assert t_slp < 3.0, f"搜索记录页刷新耗时 {t_slp:.2f}s 超标"
+        slp.filter_edit.setText("报警记录2999")
+        slp.refresh()
+        assert slp.table.rowCount() == 1, "内容筛选应缩小到 1 条"
+        slp.filter_edit.setText("")
+        # 5) mtime 缓存：文件未变时 reload 不重新解析（近似瞬时）；他机写入后能感知
+        t0 = time.perf_counter()
+        st.reload()
+        t_reload = time.perf_counter() - t0
+        assert t_reload < 0.2, f"未变更时 reload 应近乎瞬时，实际 {t_reload:.3f}s"
+        other = Store(st.data_dir)
+        other.add_search_log("他机记录", False)
+        st.reload()
+        assert len(st.search_logs) == 3001 and st.search_logs[-1].query == "他机记录", \
+            "他机写入后本机 reload 应感知到"
         print(f"  [INFO] 3000条SOP：搜索 {t_search * 1000:.0f}ms | "
-              f"库表填充 {t_fill:.2f}s | 首页搜索+记录 {t_page * 1000:.0f}ms")
+              f"库表填充 {t_fill:.2f}s | 首页搜索+记录 {t_page * 1000:.0f}ms | "
+              f"记录页刷新 {t_slp * 1000:.0f}ms(渲染500行) | reload {t_reload * 1000:.1f}ms")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -481,13 +509,13 @@ def test_ui_smoke() -> None:
         slp.refresh()
         assert slp.table.rowCount() == 2, f"搜索记录应 2 条，实际 {slp.table.rowCount()}"
         assert slp.table.item(0, 4).text() == "📎 有截图", "最新记录应显示有截图"
-        slp.filter_combo.setCurrentText("仅缺少SOP")
+        slp.status_filter.setCurrentText("仅缺少SOP")
         slp.refresh()
         assert slp.table.rowCount() == 1, "仅缺少SOP筛选应剩 1 条"
-        slp.filter_combo.setCurrentText("有截图")
+        slp.status_filter.setCurrentText("有截图")
         slp.refresh()
         assert slp.table.rowCount() == 1, "有截图筛选应剩 1 条"
-        slp.filter_combo.setCurrentText("全部")
+        slp.status_filter.setCurrentText("全部")
 
         # 弹窗“选择照片”路径：从文件载入并提交（不经 exec）
         from app.ui.search_page import ShotSubmitDialog

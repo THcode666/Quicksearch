@@ -4,9 +4,9 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QHBoxLayout,
-                               QHeaderView, QLabel, QPlainTextEdit, QPushButton,
-                               QTableWidget, QTableWidgetItem, QVBoxLayout,
-                               QWidget)
+                               QHeaderView, QLabel, QLineEdit, QPlainTextEdit,
+                               QPushButton, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidget)
 
 from app.store import STATUS_RESOLVED, STATUS_TEXT, Store
 from .common import FlashLabel, confirm
@@ -33,6 +33,8 @@ class RemarkDialog(QDialog):
 
 
 class FeedbackPage(QWidget):
+    MAX_RENDER = 500   # 一次最多渲染的行数，记录再多也不卡
+
     def __init__(self, store: Store, parent: QWidget | None = None):
         super().__init__(parent)
         self.store = store
@@ -60,6 +62,10 @@ class FeedbackPage(QWidget):
         self.remark_btn = QPushButton("✎ 编辑备注")
         self.del_btn = QPushButton("🗑 删除记录")
         self.del_btn.setObjectName("Danger")
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("筛选反馈内容/备注…")
+        self.filter_edit.setClearButtonEnabled(True)
+        self.filter_edit.setMinimumWidth(150)
         self.count_label = QLabel("")
         self.count_label.setObjectName("Muted")
         self.status_filter = QComboBox()
@@ -71,6 +77,7 @@ class FeedbackPage(QWidget):
         bar.addWidget(self.del_btn)
         bar.addStretch(1)
         bar.addWidget(self.count_label)
+        bar.addWidget(self.filter_edit)
         bar.addWidget(QLabel("状态："))
         bar.addWidget(self.status_filter)
         bar.addWidget(self.refresh_btn)
@@ -107,6 +114,7 @@ class FeedbackPage(QWidget):
         self.del_btn.clicked.connect(self._delete)
         self.refresh_btn.clicked.connect(self.refresh)
         self.status_filter.currentIndexChanged.connect(self.refresh)
+        self.filter_edit.textChanged.connect(self.refresh)
         self._set_buttons_enabled()
 
     # ---------- 展示 ----------
@@ -121,17 +129,25 @@ class FeedbackPage(QWidget):
             rows = [f for f in rows if f.status != STATUS_RESOLVED]
         elif mode == 2:
             rows = [f for f in rows if f.status == STATUS_RESOLVED]
+        text = self.filter_edit.text().strip().casefold()
+        if text:
+            rows = [f for f in rows
+                    if text in f.query.casefold() or text in f.remark.casefold()]
         # 按时间新→旧；同一秒内按记录产生顺序（后产生的在前）
         seq = list(enumerate(rows))
         seq.sort(key=lambda p: (p[1].created_at, p[0]), reverse=True)
         rows = [f for _i, f in seq]
 
+        # 只渲染最近 MAX_RENDER 条：记录再多表格也只建有限行，弱配电脑不卡
+        truncated = len(rows) > self.MAX_RENDER
+        shown = rows[:self.MAX_RENDER]
+
         # 批量填充：几千条记录也只重绘一次
         self.table.setUpdatesEnabled(False)
         try:
-            self.table.setRowCount(len(rows))
+            self.table.setRowCount(len(shown))
             pending = 0
-            for row, f in enumerate(rows):
+            for row, f in enumerate(shown):
                 status_color = QColor("#1e7f4f") if f.status == STATUS_RESOLVED else QColor("#b25e09")
                 items = [
                     QTableWidgetItem(f.created_at),
@@ -152,7 +168,10 @@ class FeedbackPage(QWidget):
                     pending += 1
         finally:
             self.table.setUpdatesEnabled(True)
-        self.count_label.setText(f"共 {len(rows)} 条，其中待补充 {pending} 条")
+        label = f"共 {len(rows)} 条，其中待补充 {pending} 条"
+        if truncated:
+            label += f"，当前显示最近 {self.MAX_RENDER} 条（可用筛选缩小范围）"
+        self.count_label.setText(label)
         self.empty_label.setVisible(len(rows) == 0)
         self._set_buttons_enabled()
 

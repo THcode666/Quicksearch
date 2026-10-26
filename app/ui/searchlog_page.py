@@ -14,9 +14,9 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QImage, QPixmap
 from PySide6.QtWidgets import (QComboBox, QDialog, QFileDialog, QHBoxLayout,
-                               QHeaderView, QLabel, QPushButton, QScrollArea,
-                               QTableWidget, QTableWidgetItem, QVBoxLayout,
-                               QWidget)
+                               QHeaderView, QLabel, QLineEdit, QPushButton,
+                               QScrollArea, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidget)
 
 from app.store import Store
 from .common import FlashLabel, confirm, info, warn
@@ -97,6 +97,8 @@ class ShotViewDialog(QDialog):
 
 
 class SearchLogPage(QWidget):
+    MAX_RENDER = Store.MAX_RENDER_ROWS   # 一次最多渲染的行数，记录再多也不卡
+
     def __init__(self, store: Store, parent: QWidget | None = None):
         super().__init__(parent)
         self.store = store
@@ -124,10 +126,14 @@ class SearchLogPage(QWidget):
         self.del_btn.setObjectName("Danger")
         self.clear_btn = QPushButton("清空记录")
         self.clear_btn.setObjectName("Danger")
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("筛选所搜内容…")
+        self.filter_edit.setClearButtonEnabled(True)
+        self.filter_edit.setMinimumWidth(150)
         self.count_label = QLabel("")
         self.count_label.setObjectName("Muted")
-        self.filter_combo = QComboBox()
-        self.filter_combo.addItems(["全部", "仅缺少SOP", "有截图"])
+        self.status_filter = QComboBox()
+        self.status_filter.addItems(["全部", "仅缺少SOP", "有截图"])
         self.refresh_btn = QPushButton("⟳ 刷新")
         self.refresh_btn.setToolTip("多机共享时，查看其他电脑产生的搜索记录")
         bar.addWidget(self.shot_btn)
@@ -135,8 +141,9 @@ class SearchLogPage(QWidget):
         bar.addWidget(self.clear_btn)
         bar.addStretch(1)
         bar.addWidget(self.count_label)
+        bar.addWidget(self.filter_edit)
         bar.addWidget(QLabel("筛选："))
-        bar.addWidget(self.filter_combo)
+        bar.addWidget(self.status_filter)
         bar.addWidget(self.refresh_btn)
         root.addLayout(bar)
 
@@ -167,7 +174,8 @@ class SearchLogPage(QWidget):
         self.del_btn.clicked.connect(self._delete_selected)
         self.clear_btn.clicked.connect(self._clear_all)
         self.refresh_btn.clicked.connect(self.refresh)
-        self.filter_combo.currentIndexChanged.connect(self.refresh)
+        self.status_filter.currentIndexChanged.connect(self.refresh)
+        self.filter_edit.textChanged.connect(self.refresh)
         self._set_buttons_enabled()
 
     # ---------- 展示 ----------
@@ -176,8 +184,11 @@ class SearchLogPage(QWidget):
         self.refresh()
 
     def refresh(self) -> None:
-        mode = self.filter_combo.currentIndex()   # 0全部 1仅缺少SOP 2有截图
+        mode = self.status_filter.currentIndex()   # 0全部 1仅缺少SOP 2有截图
         rows = list(self.store.search_logs)
+        text = self.filter_edit.text().strip().casefold()
+        if text:
+            rows = [r for r in rows if text in r.query.casefold()]
         if mode == 1:
             rows = [r for r in rows if not r.found]
         elif mode == 2:
@@ -187,14 +198,14 @@ class SearchLogPage(QWidget):
         seq.sort(key=lambda p: (p[1].time, p[0]), reverse=True)
         rows = [r for _i, r in seq]
 
-        # 批量填充：记录很多时也只重绘一次
+        # 只渲染最近 MAX_RENDER 条：记录再多表格也只建有限行，弱配电脑不卡
+        truncated = len(rows) > self.MAX_RENDER
+        shown = rows[:self.MAX_RENDER]
+
         self.table.setUpdatesEnabled(False)
         try:
-            self.table.setRowCount(len(rows))
-            missing = 0
-            for row, r in enumerate(rows):
-                if not r.found:
-                    missing += 1
+            self.table.setRowCount(len(shown))
+            for row, r in enumerate(shown):
                 date, _, time_part = r.time.partition(" ")
                 items = [
                     QTableWidgetItem(date),
@@ -219,7 +230,11 @@ class SearchLogPage(QWidget):
                     items[4].setForeground(QColor("#2f6fed"))
         finally:
             self.table.setUpdatesEnabled(True)
-        self.count_label.setText(f"共 {len(rows)} 条，其中缺少SOP {missing} 条")
+        missing = sum(1 for r in rows if not r.found)
+        label = f"共 {len(rows)} 条，其中缺少SOP {missing} 条"
+        if truncated:
+            label += f"，当前显示最近 {self.MAX_RENDER} 条（可用筛选缩小范围）"
+        self.count_label.setText(label)
         self.empty_label.setVisible(len(rows) == 0)
         self._set_buttons_enabled()
 
