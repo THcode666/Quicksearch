@@ -155,7 +155,40 @@ def test_store_roundtrip() -> None:
 
         st2.delete_sop(sop.id)
         assert st2.get_sop(sop.id) is None
-        assert not (tmp / "数据目录" / "media" / sop.id).exists(), "删除SOP应清理媒体文件"
+        assert not (tmp / "数据目录" / "media" / sop.id).exists(), "删除后页面应移入回收站"
+        # 回收站：条目存在 → 恢复 → 页面文件回位
+        assert len(st2.trash) == 1 and st2.trash[0].sop.id == sop.id, "删除应进回收站"
+        assert (tmp / "数据目录" / "trash" / sop.id).exists()
+        restored = st2.restore_sop(sop.id)
+        assert restored is not None and st2.get_sop(sop.id) is not None, "应能从回收站恢复"
+        assert st2.page_path(st2.get_sop(sop.id), 0).exists(), "恢复后页面文件应回位"
+        assert len(st2.trash) == 0 and not (tmp / "数据目录" / "trash" / sop.id).exists()
+        # 再删除 → 彻底清除（页面与版本记录一并消失）
+        st2.delete_sop(sop.id)
+        st2.purge_sop(sop.id)
+        assert st2.get_sop(sop.id) is None and len(st2.trash) == 0
+        assert not (tmp / "数据目录" / "trash" / sop.id).exists()
+
+        # 版本管理：保存自动记录 → 去重 → 回滚 → 上限裁剪
+        from app.store import Store as _St2
+        sv = _St2(tmp / "版本目录")
+        v_sop = _sop("版本SOP V1", ["EV"], solution="第一版")
+        sv.upsert_sop(v_sop)                     # 版本1
+        v_sop.name = "版本SOP V2"
+        v_sop.solution = "第二版"
+        sv.upsert_sop(v_sop)                     # 版本2
+        vers = sv.get_versions(v_sop.id)
+        assert len(vers) == 2 and vers[0].name == "版本SOP V2", "版本应新→旧排列"
+        sv.upsert_sop(v_sop)                     # 内容未变 → 不重复记录
+        assert len(sv.get_versions(v_sop.id)) == 2, "内容未变不应新增版本"
+        first = vers[-1]
+        back = sv.rollback_to_version(v_sop.id, first.id)
+        assert back is not None and back.name == "版本SOP V1" and back.solution == "第一版"
+        assert len(sv.get_versions(v_sop.id)) == 3, "回滚应生成一条新版本记录"
+        for i in range(12):                      # 超上限自动裁剪最旧的
+            v_sop.solution = f"第{i}轮修改"
+            sv.upsert_sop(v_sop)
+        assert len(sv.get_versions(v_sop.id)) == _St2.MAX_VERSIONS, "版本数应裁剪到上限"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -629,6 +662,33 @@ def test_ui_smoke() -> None:
         assert store.search_logs[-1].query == "E9002XYZ"
         assert any(r.query == "E9001" and r.found for r in store.search_logs), \
             "本机记录他机记录时应保留（合并而非覆盖）"
+
+        # 回收站对话框：删除 → 出现在回收站 → 恢复
+        from app.ui.trash_dialog import TrashDialog
+        lp.refresh()          # 先刷新到最新（他机新增的 SOP 也在内）
+        n_before = lp.table.rowCount()
+        assert n_before >= 1
+        store.delete_sop(other_sop.id)
+        lp.refresh()
+        assert lp.table.rowCount() == n_before - 1
+        td = TrashDialog(store, parent=win)
+        td.refresh()
+        assert td.table.rowCount() == 1, "回收站应出现刚删除的 SOP"
+        store.restore_sop(other_sop.id)
+        lp.refresh()
+        td.refresh()
+        assert lp.table.rowCount() == n_before and td.table.rowCount() == 0, \
+            "恢复后应回到 SOP 库且回收站清空该条"
+        td.deleteLater()
+
+        # 版本对话框：保存过的 SOP 应有版本记录，可选中
+        from app.ui.versions_dialog import VersionsDialog
+        cur = store.get_sop(sop.id)
+        store.upsert_sop(cur)   # 生成一条版本快照
+        vd = VersionsDialog(store, cur, parent=win)
+        assert vd.version_list.count() >= 1, "保存过的 SOP 应有版本记录"
+        vd.version_list.setCurrentRow(0)
+        vd.deleteLater()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

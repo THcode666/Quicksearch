@@ -50,6 +50,11 @@ class LibraryPage(QWidget):
         self.edit_btn = QPushButton("✎ 编辑")
         self.del_btn = QPushButton("🗑 删除")
         self.del_btn.setObjectName("Danger")
+        self.del_btn.setToolTip("删除进回收站，可在“♻ 回收站”中恢复")
+        self.ver_btn = QPushButton("🕘 版本记录")
+        self.ver_btn.setToolTip("查看该 SOP 的保存历史，可回滚到任一版本")
+        self.trash_btn = QPushButton("♻ 回收站")
+        self.trash_btn.setToolTip("查看误删的 SOP，可恢复或彻底删除")
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText("筛选：名称/代码/解决方式…")
         self.filter_edit.setClearButtonEnabled(True)
@@ -61,7 +66,8 @@ class LibraryPage(QWidget):
         self.refresh_btn = QPushButton("⟳ 刷新")
         self.refresh_btn.setToolTip("重新从数据目录读取（多机共享时可见其他电脑的更新）")
 
-        for w in (self.new_btn, self.edit_btn, self.del_btn):
+        for w in (self.new_btn, self.edit_btn, self.del_btn,
+                  self.ver_btn, self.trash_btn):
             bar.addWidget(w)
         bar.addStretch(1)
         bar.addWidget(QLabel("排序："))
@@ -99,6 +105,8 @@ class LibraryPage(QWidget):
         self.new_btn.clicked.connect(self._on_new)
         self.edit_btn.clicked.connect(self._on_edit)
         self.del_btn.clicked.connect(self._on_delete)
+        self.ver_btn.clicked.connect(self._on_versions)
+        self.trash_btn.clicked.connect(self._on_trash)
         self.refresh_btn.clicked.connect(self.refresh)
         self.filter_edit.textChanged.connect(self.refresh)
         self.sort_combo.currentIndexChanged.connect(self._on_sort_mode_changed)
@@ -176,6 +184,47 @@ class LibraryPage(QWidget):
         has = self._selected_id() is not None
         self.edit_btn.setEnabled(has)
         self.del_btn.setEnabled(has)
+        self.ver_btn.setEnabled(has)
+
+    # ---------- 版本记录 / 回收站 ----------
+    def _on_versions(self) -> None:
+        sop_id = self._selected_id()
+        if not sop_id:
+            return
+        sop = self.store.get_sop(sop_id)
+        if not sop:
+            return
+        from .versions_dialog import VersionsDialog
+        dlg = VersionsDialog(self.store, sop, self)
+        dlg.exec()
+        if dlg.rolled_back:
+            self.refresh()
+            self.flash.flash("✔ 已回滚，当前内容已保存为新版本。")
+
+    def _on_trash(self) -> None:
+        from .trash_dialog import TrashDialog
+        dlg = TrashDialog(self.store, self)
+        dlg.exec()
+        if dlg.restored_any:
+            self.refresh()
+            self.flash.flash("✔ 已从回收站恢复 SOP。")
+
+    def _on_delete(self) -> None:
+        sop_id = self._selected_id()
+        if not sop_id:
+            return
+        sop = self.store.get_sop(sop_id)
+        if not sop:
+            return
+        if confirm(self, "删除 SOP",
+                   f"确定删除「{sop.name}」吗？\n\n"
+                   "删除后会进入回收站（页面文件一并保留），可随时到“♻ 回收站”恢复；"
+                   "在回收站中“彻底删除”后才真正清除。"):
+            if self.store.delete_sop(sop_id):
+                self.refresh()
+                self.flash.flash("✔ 已删除进回收站。")
+            else:
+                self.refresh()
 
     def _on_double_click(self, item) -> None:
         sop_id = self.table.item(item.row(), 0).data(Qt.UserRole)
@@ -199,16 +248,3 @@ class LibraryPage(QWidget):
         if dlg.exec() and dlg.saved_id:
             self.refresh()
             self.flash.flash("✔ SOP 已更新。")
-
-    def _on_delete(self) -> None:
-        sop_id = self._selected_id()
-        if not sop_id:
-            return
-        sop = self.store.get_sop(sop_id)
-        if not sop:
-            return
-        if confirm(self, "删除 SOP",
-                   f"确定删除「{sop.name}」吗？\n\n该 SOP 的所有页面文件将一并删除，且不可恢复。"):
-            self.store.delete_sop(sop_id)
-            self.refresh()
-            self.flash.flash("✔ 已删除。")
