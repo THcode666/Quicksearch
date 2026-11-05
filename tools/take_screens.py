@@ -138,7 +138,8 @@ def main() -> int:
         win.searchlog_page.refresh()
         snap("08_搜索记录")
         # 09 设置
-        sd = SettingsDialog(cfg, win.store, win)
+        from app.security import PasswordGate
+        sd = SettingsDialog(PasswordGate(win.store.data_dir), cfg, win.store, win)
         sd.resize(640, 480)
         sd.show()
         app.processEvents()

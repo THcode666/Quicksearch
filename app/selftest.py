@@ -479,10 +479,29 @@ def test_scale_performance() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------------- 密码保护 ----------------
+def test_password_gate() -> None:
+    from app.security import PasswordGate
+    tmp = Path(tempfile.mkdtemp(prefix="qs_pwd_"))
+    try:
+        g = PasswordGate(tmp / "数据目录")
+        assert g.using_default(), "首次使用应为出厂密码"
+        assert g.change("错误旧密码", "新密码99") is False, "旧密码错误应拒绝修改"
+        g.set_password("New99")
+        assert g.verify("New99") and not g.using_default()
+        assert not g.verify("")
+        # 持久化：新实例（模拟另一次启动/另一台电脑）仍验证通过
+        g2 = PasswordGate(tmp / "数据目录")
+        assert g2.verify("New99") and not g2.verify("错")
+        assert not g2.using_default()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ---------------- 界面冒烟测试 ----------------
 def test_ui_smoke() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QDialog
     from PySide6.QtGui import QImage, QPainter, QColor, QFont
     from app.config import Config
     from app.store import Store
@@ -689,6 +708,29 @@ def test_ui_smoke() -> None:
         assert vd.version_list.count() >= 1, "保存过的 SOP 应有版本记录"
         vd.version_list.setCurrentRow(0)
         vd.deleteLater()
+
+        # SOP 库密码门：未解锁不进入；校验正确进入；离开页面重新上锁
+        win._library_unlocked = False
+        win.pwd_gate.set_password("UiTest123")
+        win.show_page(1)   # 无界面场景：弹窗视为取消，停留在当前页
+        assert win.stack.currentWidget() is not win.library_page, "未解锁不应进入SOP库"
+        assert win._library_unlocked is False
+        assert win._enter_library_with_password("错的密码") is False
+        assert win._enter_library_with_password("UiTest123") is True
+        win.show_page(1)
+        assert win.stack.currentWidget() is win.library_page, "解锁后应能进入SOP库"
+        win.show_page(0)
+        assert win._library_unlocked is False, "离开SOP库应重新上锁"
+        # 密码输入框：错误密码不通过，正确密码通过
+        from app.ui.password_dialog import PasswordDialog
+        pd = PasswordDialog(win.pwd_gate, parent=win)
+        pd.edit.setText("bad")
+        pd._attempt()
+        assert pd.result() != QDialog.Accepted, "错误密码不应接受"
+        pd.edit.setText("UiTest123")
+        pd._attempt()
+        assert pd.result() == QDialog.Accepted, "正确密码应接受"
+        pd.deleteLater()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -703,6 +745,7 @@ def run_all(include_ui: bool = True) -> int:
     _case("配置读写", test_config)
     _case("PPT转换降级", test_converter_graceful)
     _case("PDF导入", test_pdf_convert)
+    _case("密码保护", test_password_gate)
     if include_ui:
         _case("图标绘制", test_icons)
         _case("界面冒烟测试", test_ui_smoke)

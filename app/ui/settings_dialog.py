@@ -12,14 +12,73 @@ from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFileDialog,
                                QPushButton, QSpinBox, QVBoxLayout)
 
 from app.config import APP_VERSION, Config
+from app.security import PasswordGate
 from app.store import Store
 
 
+class ChangePasswordDialog(QDialog):
+    """修改 SOP 库访问密码（需先验证旧密码）。"""
+
+    def __init__(self, gate: PasswordGate, parent=None):
+        super().__init__(parent)
+        self.gate = gate
+        self.changed = False
+        self.setWindowTitle("修改 SOP 库密码")
+        self.setMinimumWidth(420)
+
+        root = QVBoxLayout(self)
+        root.setSpacing(8)
+        root.addWidget(QLabel("旧密码："))
+        self.old_edit = QLineEdit()
+        self.old_edit.setEchoMode(QLineEdit.Password)
+        root.addWidget(self.old_edit)
+        root.addWidget(QLabel("新密码（至少 4 位）："))
+        self.new_edit = QLineEdit()
+        self.new_edit.setEchoMode(QLineEdit.Password)
+        root.addWidget(self.new_edit)
+        root.addWidget(QLabel("确认新密码："))
+        self.confirm_edit = QLineEdit()
+        self.confirm_edit.setEchoMode(QLineEdit.Password)
+        root.addWidget(self.confirm_edit)
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet("color:#c62828;")
+        self.error_label.hide()
+        root.addWidget(self.error_label)
+
+        bb = QDialogButtonBox()
+        ok = bb.addButton("修改", QDialogButtonBox.AcceptRole)
+        ok.setObjectName("Primary")
+        bb.addButton("取消", QDialogButtonBox.RejectRole)
+        bb.accepted.connect(self._submit)
+        bb.rejected.connect(self.reject)
+        root.addWidget(bb)
+
+    def _submit(self) -> None:
+        old = self.old_edit.text()
+        new = self.new_edit.text().strip()
+        confirm_txt = self.confirm_edit.text()
+        if len(new) < 4:
+            self.error_label.setText("新密码至少需要 4 位。")
+            self.error_label.show()
+            return
+        if new != confirm_txt:
+            self.error_label.setText("两次输入的新密码不一致。")
+            self.error_label.show()
+            return
+        if not self.gate.change(old, new):
+            self.error_label.setText("旧密码不正确。")
+            self.error_label.show()
+            return
+        self.changed = True
+        self.accept()
+
+
 class SettingsDialog(QDialog):
-    def __init__(self, cfg: Config, store: Store, parent=None):
+    def __init__(self, gate: PasswordGate, cfg: Config, store: Store, parent=None):
         super().__init__(parent)
         self.cfg = cfg
         self.store = store
+        self.pwd_gate = gate
         self.data_dir_changed = False
         self.setWindowTitle("设置")
         self.setMinimumWidth(560)
@@ -71,6 +130,15 @@ class SettingsDialog(QDialog):
         backup_row.addStretch(1)
         root.addLayout(backup_row)
 
+        # ---- SOP 库密码 ----
+        pwd_row = QHBoxLayout()
+        pwd_btn = QPushButton("修改 SOP 库密码…")
+        pwd_btn.setToolTip("修改进入 SOP 库所需的访问密码（多机共享时全网络统一生效）")
+        pwd_btn.clicked.connect(self._change_password)
+        pwd_row.addWidget(pwd_btn)
+        pwd_row.addStretch(1)
+        root.addLayout(pwd_row)
+
         # ---- 关于 ----
         about = QLabel(f"Quicksearch v{APP_VERSION} — 机台报警 SOP 快速查找 / SOP 库管理 / 反馈跟踪")
         about.setObjectName("Muted")
@@ -111,6 +179,14 @@ class SettingsDialog(QDialog):
         finally:
             self.unsetCursor()
         QMessageBox.information(self, "备份完成", f"已备份到：\n{target}")
+
+    def _change_password(self) -> None:
+        from .common import info
+        dlg = ChangePasswordDialog(self.pwd_gate, self)
+        dlg.exec()
+        if dlg.changed:
+            info(self, "修改完成",
+                 "SOP 库密码已修改。\n其他电脑下次进入 SOP 库时需输入新密码（无需重启）。")
 
     def _save(self) -> None:
         new_dir = self.dir_edit.text().strip()

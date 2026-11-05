@@ -5,11 +5,12 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence, QShortcut
-from PySide6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QLabel,
-                               QMainWindow, QPushButton, QStackedWidget,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QButtonGroup, QDialog, QFrame, QHBoxLayout,
+                               QLabel, QMainWindow, QPushButton,
+                               QStackedWidget, QVBoxLayout, QWidget)
 
 from app.config import APP_TITLE, APP_VERSION, Config
+from app.security import PasswordGate
 from app.store import Store
 from .feedback_page import FeedbackPage
 from .library_page import LibraryPage
@@ -26,6 +27,8 @@ class MainWindow(QMainWindow):
         self.cfg = cfg or Config()
         data_dir = Path(data_dir_override) if data_dir_override else self.cfg.resolve_data_dir()
         self.store = Store(data_dir)
+        self.pwd_gate = PasswordGate(data_dir)
+        self._library_unlocked = False   # 离开 SOP 库页面即重新上锁
 
         self.setWindowTitle(APP_TITLE)
         from app.icons import make_icon
@@ -118,8 +121,37 @@ class MainWindow(QMainWindow):
         except OSError:
             pass
 
+    def _enter_library_with_password(self, password: str) -> bool:
+        """校验 SOP 库密码，正确则解锁本次进入。"""
+        if self.pwd_gate.verify(password):
+            self._library_unlocked = True
+            return True
+        return False
+
+    def _ask_library_password(self) -> bool:
+        """弹出密码对话框；无界面场景（自测/截图）直接视为取消。"""
+        if not self.isVisible():
+            return False
+        from .password_dialog import PasswordDialog
+        dlg = PasswordDialog(self.pwd_gate, self)
+        return dlg.exec() == QDialog.Accepted
+
+    def _sync_nav_selection(self) -> None:
+        """导航按钮选中状态与当前实际页面保持一致（密码取消时回退）。"""
+        idx = self.stack.currentIndex()
+        for i, btn in enumerate(self.nav_buttons):
+            btn.setChecked(i == idx)
+
     def show_page(self, index: int) -> None:
-        """index: 0查找 1库 2反馈 3搜索记录"""
+        """index: 0查找 1库 2反馈 3搜索记录。SOP 库需密码解锁，离开即重新上锁。"""
+        if index == 1 and not self._library_unlocked:
+            if not self._ask_library_password():
+                self._sync_nav_selection()
+                return
+            self._library_unlocked = True
+        else:
+            if index != 1:
+                self._library_unlocked = False
         self._reload_store()
         if self.stack.currentWidget() is self.viewer_page:
             self._prev_page_index = index
@@ -161,14 +193,17 @@ class MainWindow(QMainWindow):
 
     # ---------- 设置 ----------
     def _open_settings(self) -> None:
-        dlg = SettingsDialog(self.cfg, self.store, self)
+        dlg = SettingsDialog(self.pwd_gate, self.cfg, self.store, self)
         dlg.exec()
         if dlg.data_dir_changed:
             self.apply_data_dir(Path(self.cfg.resolve_data_dir()))
 
     def apply_data_dir(self, new_dir: Path) -> None:
-        """切换数据目录（共享部署时使用），所有页面重新加载数据。"""
+        """切换数据目录（共享部署时使用），所有页面重新加载数据。
+        密码跟随数据目录，切换后重新上锁。"""
         self.store = Store(new_dir)
+        self.pwd_gate = PasswordGate(new_dir)
+        self._library_unlocked = False
         self.search_page.set_store(self.store)
         self.library_page.set_store(self.store)
         self.feedback_page.set_store(self.store)
