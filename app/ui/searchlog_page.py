@@ -1,14 +1,14 @@
 """搜索记录页：自动记录每次搜索（日期、时间、所搜报警代码、是否找到SOP、报错截图）。
 
-- 已搜到 → 绿色"已搜到"
-- 缺少 SOP → 橙红"⚠ 缺少对应SOP"（三角警示符），工程师据此补 SOP
-- 产线人员提交的机台报错截图显示为"📎 有截图"，双击行或点"查看截图"放大查看，
-  查看窗里可"另存为…"把截图保存到指定位置
-记录超过上限（10000 条）时自动丢弃最旧的。
+- 已搜到 → 绿色"已搜到"；缺少 SOP → 橙红"⚠ 缺少对应SOP"，工程师据此补 SOP
+- 产线人员提交的机台报错截图显示为"📎 有截图"，双击行或点"查看截图"放大查看、可另存
+- 存储为追加式日志（多机并发安全），页面只显示最近记录，可一键导出 Excel（CSV）
 """
 from __future__ import annotations
 
+import csv
 import re
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -22,6 +22,7 @@ from app.store import Store
 from .common import FlashLabel, confirm, info, warn
 
 COLS = ["日期", "时间", "所搜报警代码", "结果", "截图"]
+SOURCE_READ = 2000   # 每次刷新读取的最近记录条数（筛选在这个范围内进行）
 
 
 def _safe_filename(text: str, limit: int = 40) -> str:
@@ -120,6 +121,9 @@ class SearchLogPage(QWidget):
         root.addLayout(head)
 
         bar = QHBoxLayout()
+        self.export_btn = QPushButton("📥 导出Excel…")
+        self.export_btn.setToolTip("把全部搜索记录（含归档）导出为 Excel 可直接打开的 CSV 文件")
+        self.export_btn.clicked.connect(self._export_csv)
         self.shot_btn = QPushButton("🖼 查看截图")
         self.shot_btn.setToolTip("查看该记录提交的机台报错截图")
         self.del_btn = QPushButton("🗑 删除选中")
@@ -136,6 +140,7 @@ class SearchLogPage(QWidget):
         self.status_filter.addItems(["全部", "仅缺少SOP", "有截图"])
         self.refresh_btn = QPushButton("⟳ 刷新")
         self.refresh_btn.setToolTip("多机共享时，查看其他电脑产生的搜索记录")
+        bar.addWidget(self.export_btn)
         bar.addWidget(self.shot_btn)
         bar.addWidget(self.del_btn)
         bar.addWidget(self.clear_btn)
@@ -185,7 +190,8 @@ class SearchLogPage(QWidget):
 
     def refresh(self) -> None:
         mode = self.status_filter.currentIndex()   # 0全部 1仅缺少SOP 2有截图
-        rows = list(self.store.search_logs)
+        # 只读取日志尾部（最近 SOURCE_READ 条，新→旧）：记录总量再多也毫秒级
+        rows = self.store.read_search_logs(limit=SOURCE_READ)
         text = self.filter_edit.text().strip().casefold()
         if text:
             rows = [r for r in rows if text in r.query.casefold()]
@@ -193,12 +199,8 @@ class SearchLogPage(QWidget):
             rows = [r for r in rows if not r.found]
         elif mode == 2:
             rows = [r for r in rows if r.shot]
-        # 按时间新→旧；同一秒内按记录产生顺序（后产生的在前）
-        seq = list(enumerate(rows))
-        seq.sort(key=lambda p: (p[1].time, p[0]), reverse=True)
-        rows = [r for _i, r in seq]
 
-        # 只渲染最近 MAX_RENDER 条：记录再多表格也只建有限行，弱配电脑不卡
+        # 只渲染最近 MAX_RENDER 条：表格行数恒定，弱配电脑不卡
         truncated = len(rows) > self.MAX_RENDER
         shown = rows[:self.MAX_RENDER]
 
@@ -231,12 +233,47 @@ class SearchLogPage(QWidget):
         finally:
             self.table.setUpdatesEnabled(True)
         missing = sum(1 for r in rows if not r.found)
-        label = f"共 {len(rows)} 条，其中缺少SOP {missing} 条"
+        label = (f"日志共 {self.store.count_search_logs()} 条 | "
+                 f"显示最近 {len(shown)} 条，其中缺少SOP {missing} 条")
         if truncated:
-            label += f"，当前显示最近 {self.MAX_RENDER} 条（可用筛选缩小范围）"
+            label += "（更早记录请点“导出Excel”查看）"
         self.count_label.setText(label)
-        self.empty_label.setVisible(len(rows) == 0)
+        self.empty_label.setVisible(len(shown) == 0)
         self._set_buttons_enabled()
+
+    def _export_csv(self) -> None:
+        """把全部搜索记录（含归档）导出为 Excel 可直接打开的 CSV。"""
+        recs = self.store.read_all_search_logs()
+        if not recs:
+            info(self, "提示", "还没有任何搜索记录可导出。")
+            return
+        default_name = f"搜索记录导出_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        desktop = Path.home() / "Desktop"
+        start_dir = str(desktop / default_name) if desktop.exists() else default_name
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出搜索记录（Excel 可直接打开）", start_dir,
+            "CSV 文件 (*.csv);;所有文件 (*.*)")
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["日期", "时间", "所搜报警代码", "结果", "报错截图"])
+                for r in recs:   # 旧→新，便于按时间阅读
+                    d, _, t = r.time.partition(" ")
+                    w.writerow([d, t, r.query,
+                                "已搜到" if r.found else "缺少对应SOP",
+                                "有截图" if r.shot else "无"])
+        except OSError as e:
+            warn(self, "导出失败",
+                 f"写入失败：{e}\n\n若目标文件正被 Excel 打开，请先关闭它，"
+                 "或另选一个保存位置。")
+            return
+        info(self, "导出完成",
+             f"已导出 {len(recs)} 条搜索记录到：\n{path}\n\n"
+             "用 Excel/WPS 打开即可查看与统计（含归档文件中的全部记录）。")
 
     # ---------- 操作 ----------
     def _selected_id(self) -> str | None:
@@ -248,10 +285,14 @@ class SearchLogPage(QWidget):
         return it.data(Qt.UserRole) if it else None
 
     def _selected_record(self):
+        """从最近读取的记录里按 id 找当前选中行对应的记录。"""
         log_id = self._selected_id()
         if not log_id:
             return None
-        return next((r for r in self.store.search_logs if r.id == log_id), None)
+        for r in self.store.read_search_logs(limit=SOURCE_READ):
+            if r.id == log_id:
+                return r
+        return None
 
     def _set_buttons_enabled(self) -> None:
         rec = self._selected_record()
@@ -284,10 +325,11 @@ class SearchLogPage(QWidget):
         self.flash.flash("✔ 已删除该条记录。")
 
     def _clear_all(self) -> None:
-        if not self.store.search_logs:
+        total = self.store.count_search_logs()
+        if not total:
             return
         if confirm(self, "清空搜索记录",
-                   f"确定清空全部 {len(self.store.search_logs)} 条搜索记录吗？\n\n"
+                   f"确定清空全部 {total} 条搜索记录吗？\n\n"
                    "已提交的报错截图也会一并删除，此操作不可恢复。"):
             self.store.clear_search_logs()
             self.refresh()

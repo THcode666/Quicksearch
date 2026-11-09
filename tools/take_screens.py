@@ -73,10 +73,10 @@ def build_demo(data_dir: Path) -> Store:
     fb = st.add_feedback("E4304 风扇报警一直出现", "已按SOP处理，建议补充滤网型号")
     st.set_feedback_status(fb.id, True)
     st.set_feedback_remark(fb.id, "已在 E4304 SOP 中补充滤网型号信息。")
-    st.add_search_log("E4303", True)
-    st.add_search_log("430", True)
-    st.add_search_log("E5201 chamber 门传感器异常", False)
-    st.add_search_log("E4304", True)
+    st.append_search_log("E4303", True)
+    st.append_search_log("430", True)
+    st.append_search_log("E5201 chamber 门传感器异常", False)
+    st.append_search_log("E4304", True)
     return st
 
 

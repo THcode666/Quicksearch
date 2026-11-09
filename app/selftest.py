@@ -94,40 +94,40 @@ def test_store_roundtrip() -> None:
         assert st2.get_feedback(fb.id) is None
 
         # 搜索记录：自动记录、重新载入、删除、清空
-        st2.add_search_log("E4303", True)
-        st2.add_search_log("E9999", False)
+        r1 = st2.append_search_log("E4303", True)
+        r2 = st2.append_search_log("E9999", False)
         st3 = Store(tmp / "数据目录")
-        assert len(st3.search_logs) == 2, "搜索记录应持久化"
-        assert st3.search_logs[0].query == "E4303" and st3.search_logs[0].found
-        assert not st3.search_logs[1].found
-        assert " " in st3.search_logs[0].time, "时间应含日期+时间"
+        logs = st3.read_search_logs(limit=10)   # 新→旧
+        assert [x.query for x in logs] == ["E9999", "E4303"], "搜索记录应持久化（新→旧）"
+        assert logs[1].found is True and logs[0].found is False
+        assert " " in logs[0].time, "时间应含日期+时间"
+        assert st3.count_search_logs() == 2
 
         # 报错截图：转存、路径、随记录删除
-        rec = st3.search_logs[1]
+        rec = st3.read_search_logs(limit=10)[0]   # 即 r2
         shot_src = tmp / "报错截图.png"
         shot_src.write_bytes(b"\x89PNG fake image")
         rel = st3.set_search_log_shot(rec.id, shot_src)
         assert rel == f"shots/{rec.id}.png", rel
-        # 写入会重读共享盘，按 id 重新获取最新对象再断言
-        rec_fresh = next(r for r in st3.search_logs if r.id == rec.id)
-        assert st3.search_log_shot_path(rec_fresh) is not None
-        st3.delete_search_log(rec.id)
-        assert not (tmp / "数据目录" / "shots" / f"{rec.id}.png").exists(), "删记录应连带删截图"
+        assert st3.search_log_shot_path(rec.id) is not None
+        st3.delete_search_log(r1.id)
+        assert st3.count_search_logs() == 1, "删除单条应移除该行"
+        assert not (tmp / "数据目录" / "shots" / f"{r1.id}.png").exists(), "删记录应连带删截图"
 
         st3.clear_search_logs()
-        assert st3.search_logs == []
+        assert st3.count_search_logs() == 0
 
         # 多机场景：两个 Store 实例模拟两台电脑共用共享目录
         from app.store import STATUS_RESOLVED as _RESOLVED
         shared = tmp / "共享"
         stA = Store(shared)
         stB = Store(shared)
-        stA.add_search_log("E1", True)
-        stB.add_search_log("E2", False)
-        stA.add_search_log("E3", True)
-        assert [r.query for r in stA.search_logs] == ["E1", "E2", "E3"], \
-            f"他机的搜索记录不应被覆盖：{[r.query for r in stA.search_logs]}"
-        assert Store(shared).search_logs[-1].query == "E3"
+        stA.append_search_log("E1", True)
+        stB.append_search_log("E2", False)
+        stA.append_search_log("E3", True)
+        assert [r.query for r in stA.read_search_logs(limit=10)] == ["E3", "E2", "E1"], \
+            f"他机的搜索记录不应被覆盖：{[r.query for r in stA.read_search_logs(limit=10)]}"
+        assert Store(shared).count_search_logs() == 3
 
         fa = stA.add_feedback("反馈A")
         stB.add_feedback("反馈B")
@@ -145,13 +145,15 @@ def test_store_roundtrip() -> None:
         assert chk.get_sop(sop_a.id).name == "共享SOP-A2"
         assert any(s.name == "共享SOP-B" for s in chk.sops), "他机新增的SOP不应被覆盖"
 
-        # 超上限自动丢弃最旧
-        from app.store import SearchLog
-        for i in range(st3.MAX_SEARCH_LOGS + 5):
-            st3.search_logs.append(SearchLog(query=f"Q{i}", found=True))
-        st3.save_search_logs()
-        assert len(st3.search_logs) == st3.MAX_SEARCH_LOGS, "应裁剪到上限"
-        assert st3.search_logs[-1].query == f"Q{st3.MAX_SEARCH_LOGS + 4}", "应保留最新的"
+        # 超限自动归档：活动日志改名 searchlog-<时间戳>.jsonl，新搜索写入新文件
+        st3.SEARCHLOG_ROTATE_BYTES = 32 * 1024   # 测试用小阈值
+        for i in range(600):                     # 每条约110字节，足以触发轮转
+            st3.append_search_log(f"Q{i}", True)
+        assert list(st3.data_dir.glob("searchlog-*.jsonl")), "应产生归档文件"
+        all_recs = st3.read_all_search_logs()
+        assert len(all_recs) >= 600, "全量读取应包含归档+活动文件"
+        assert st3.count_search_logs() < 600, "活动文件应只含轮转后的新记录"
+        assert all_recs[0].query == "Q0" and all_recs[-1].query == "Q599", "导出顺序应旧→新"
 
         st2.delete_sop(sop.id)
         assert st2.get_sop(sop.id) is None
@@ -443,14 +445,13 @@ def test_scale_performance() -> None:
         sp._do_search()
         t_page = time.perf_counter() - t0
         assert len(sp._results) == 50   # 上限 50 条
-        assert len(st.search_logs) == 1
+        assert st.count_search_logs() == 1
         assert t_page < 1.0, f"首页搜索耗时 {t_page:.3f}s 超标"
-        # 4) 搜索记录页：3000 条记录下刷新只渲染最近 500 条，且要快
-        from app.store import SearchLog
+        # 4) 搜索记录页：追加 3000 条后刷新只解析日志尾部并渲染最近 500 条，且要快
         from app.ui.searchlog_page import SearchLogPage
-        st.search_logs = [SearchLog(query=f"E{i} 报警记录{i} 处理", found=(i % 3 != 0))
-                          for i in range(3000)]
-        st.save_search_logs()
+        for i in range(3000):
+            st.append_search_log(f"E{i} 报警记录{i} 处理", (i % 3 != 0))
+        assert st.count_search_logs() == 3001
         slp = SearchLogPage(st)
         t0 = time.perf_counter()
         slp.refresh()
@@ -462,16 +463,16 @@ def test_scale_performance() -> None:
         slp.refresh()
         assert slp.table.rowCount() == 1, "内容筛选应缩小到 1 条"
         slp.filter_edit.setText("")
-        # 5) mtime 缓存：文件未变时 reload 不重新解析（近似瞬时）；他机写入后能感知
+        # 5) reload 不再解析搜索日志：记录再多也瞬时（多机同步零负担）
         t0 = time.perf_counter()
         st.reload()
         t_reload = time.perf_counter() - t0
         assert t_reload < 0.2, f"未变更时 reload 应近乎瞬时，实际 {t_reload:.3f}s"
         other = Store(st.data_dir)
-        other.add_search_log("他机记录", False)
+        other.append_search_log("他机记录", False)
         st.reload()
-        assert len(st.search_logs) == 3001 and st.search_logs[-1].query == "他机记录", \
-            "他机写入后本机 reload 应感知到"
+        assert st.count_search_logs() == 3002 and st.read_search_logs(limit=1)[0].query == "他机记录", \
+            "他机写入后本机应能读到"
         print(f"  [INFO] 3000条SOP：搜索 {t_search * 1000:.0f}ms | "
               f"库表填充 {t_fill:.2f}s | 首页搜索+记录 {t_page * 1000:.0f}ms | "
               f"记录页刷新 {t_slp * 1000:.0f}ms(渲染500行) | reload {t_reload * 1000:.1f}ms")
@@ -543,13 +544,14 @@ def test_ui_smoke() -> None:
         sp.input.setText("4303")
         sp._do_search()
         assert len(sp._results) == 1, f"搜索 4303 应命中 1 条，实际 {len(sp._results)}"
-        assert store.search_logs and store.search_logs[-1].query == "4303"
-        assert store.search_logs[-1].found is True, "命中应记录为已搜到"
+        recent = store.read_search_logs(limit=5)   # 新→旧
+        assert recent and recent[0].query == "4303"
+        assert recent[0].found is True, "命中应记录为已搜到"
         sp.input.setText("不存在的报警XYZ")
         sp._do_search()
         assert len(sp._results) == 0
         assert sp.notfound_hint.isVisibleTo(sp), "未找到应显示提示"
-        rec = store.search_logs[-1]
+        rec = store.read_search_logs(limit=1)[0]
         assert rec.found is False, "未找到应自动记录"
         assert rec.query == "不存在的报警XYZ"
 
@@ -571,15 +573,15 @@ def test_ui_smoke() -> None:
 
         # 弹窗“选择照片”路径：从文件载入并提交（不经 exec）
         from app.ui.search_page import ShotSubmitDialog
-        rec2 = store.add_search_log("E8888 换句话说搜不到", False)
+        rec2 = store.append_search_log("E8888 换句话说搜不到", False)
         photo = tmp / "手机照片.jpg"
         QImage(200, 150, QImage.Format_RGB32).save(str(photo))
         dlg = ShotSubmitDialog(store, rec2.id, "E8888", win)
         dlg._set_image(QImage(str(photo)), photo)
         dlg._submit()
-        rec2 = next(r for r in store.search_logs if r.id == rec2.id)   # 重读后取最新对象
+        rec2 = store.read_search_logs(limit=5)[0]   # 最新一条
         assert rec2.shot == f"shots/{rec2.id}.jpg", f"照片应随记录保存: {rec2.shot}"
-        assert store.search_log_shot_path(rec2) is not None
+        assert store.search_log_shot_path(rec2.id) is not None
 
         # 截图查看窗：另存到指定位置
         from app.ui.searchlog_page import ShotViewDialog, _safe_filename
@@ -675,11 +677,11 @@ def test_ui_smoke() -> None:
         sp.input.setText("E9001")
         sp._do_search()   # 搜索前自动重读共享数据
         assert len(sp._results) == 1, "另一台电脑新增的SOP应无需重启即可搜到"
-        other.add_search_log("E9001", True)   # 他机产生的搜索记录
+        other.append_search_log("E9001", True)   # 他机产生的搜索记录
         sp.input.setText("E9002XYZ")
         sp._do_search()   # 未找到 → 本机自动记录
-        assert store.search_logs[-1].query == "E9002XYZ"
-        assert any(r.query == "E9001" and r.found for r in store.search_logs), \
+        assert store.read_search_logs(limit=1)[0].query == "E9002XYZ"
+        assert any(r.query == "E9001" and r.found for r in store.read_search_logs(limit=10)), \
             "本机记录他机记录时应保留（合并而非覆盖）"
 
         # 回收站对话框：删除 → 出现在回收站 → 恢复

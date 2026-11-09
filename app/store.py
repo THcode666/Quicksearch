@@ -232,7 +232,8 @@ class Store:
     Data/
       sops.json        SOP 索引（只含元数据，启动时整体载入内存，体积极小）
       feedback.json    反馈记录
-      searchlog.json   搜索记录（自动记录，超过上限自动丢弃最旧的）
+      searchlog.jsonl  搜索记录（一行一条的追加式日志：多机并发只追加不覆盖，O(1)写入；
+                       超 5MB 自动归档为 searchlog-<时间戳>.jsonl）
       versions.json    版本快照索引（每个 SOP 保留最近 MAX_VERSIONS 个版本）
       trash.json       回收站索引
       media/<sop_id>/  SOP 页面图片（查看时按需加载，不常驻内存）
@@ -240,8 +241,9 @@ class Store:
       trash/<sop_id>/  回收站中 SOP 的页面图片
     """
 
-    MAX_SEARCH_LOGS = 10000   # 搜索记录上限，防止无限增长
     MAX_RENDER_ROWS = 500     # 列表页一次最多渲染的行数（超过部分用筛选缩小范围）
+    SEARCHLOG_ROTATE_BYTES = 5 * 1024 * 1024   # 搜索日志超 5MB 自动归档
+    SEARCHLOG_TAIL_BYTES = 256 * 1024          # 页面显示只解析日志尾部（约2千条）
     MAX_VERSIONS = 10         # 每个 SOP 保留的版本快照数（超出自动裁剪最旧的）
 
     def __init__(self, data_dir: Path):
@@ -249,18 +251,17 @@ class Store:
         self.media_root = self.data_dir / "media"
         self.sops_path = self.data_dir / "sops.json"
         self.feedback_path = self.data_dir / "feedback.json"
-        self.searchlog_path = self.data_dir / "searchlog.json"
+        self.searchlog_path = self.data_dir / "searchlog.jsonl"
         self.versions_path = self.data_dir / "versions.json"
         self.trash_path = self.data_dir / "trash.json"
         self.sops: list[Sop] = []
         self.feedback: list[Feedback] = []
-        self.search_logs: list[SearchLog] = []
         self.trash: list[TrashEntry] = []
         self.versions: dict[str, list[SopVersion]] = {}   # sop_id → 旧→新
         # 各数据文件的 (mtime, size) 签名缓存：文件没变就跳过重新解析（多机同步的重读代价优化）。
         # 只比 mtime 会因 Windows 时间戳粒度漏掉同一时间片内的他机写入（append 必然改变 size，
         # 双特征可关闭该竞态窗口）；哨兵 object() 保证首次必读。
-        self._sigs = {"sops": object(), "feedback": object(), "searchlog": object(),
+        self._sigs = {"sops": object(), "feedback": object(),"trash": object(), "versions": object(),
                       "trash": object(), "versions": object()}
         self.load_all()
 
@@ -294,13 +295,6 @@ class Store:
         self.feedback = [Feedback.from_dict(d) for d in raw.get("records", [])]
         self._mark("feedback", self.feedback_path)
 
-    def _load_search_logs(self, force: bool = False) -> None:
-        if not force and not self._changed("searchlog", self.searchlog_path):
-            return
-        raw = load_json(self.searchlog_path, {"version": 1, "records": []})
-        self.search_logs = [SearchLog.from_dict(d) for d in raw.get("records", [])]
-        self._mark("searchlog", self.searchlog_path)
-
     def _load_trash(self, force: bool = False) -> None:
         if not force and not self._changed("trash", self.trash_path):
             return
@@ -322,9 +316,168 @@ class Store:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._load_sops()
         self._load_feedback()
-        self._load_search_logs()
         self._load_trash()
         self._load_versions()
+
+    # ---------- 搜索记录（JSONL 追加式：多机并发只追加不覆盖，写入 O(1)） ----------
+    def _iter_searchlog_files(self) -> list[Path]:
+        """[归档文件…, 活动文件]，按产生时间顺序排列。"""
+        files = sorted(self.data_dir.glob("searchlog-*.jsonl"))
+        if self.searchlog_path.exists():
+            files.append(self.searchlog_path)
+        return files
+
+    def _migrate_searchlog(self) -> None:
+        """旧版 searchlog.json（整份数组）→ 迁移为 searchlog.jsonl 逐行格式。"""
+        old = self.data_dir / "searchlog.json"
+        if not old.exists():
+            return
+        try:
+            raw = load_json(old, {"version": 1, "records": []})
+            lines = [json.dumps(r, ensure_ascii=False) for r in raw.get("records", [])]
+            with open(self.searchlog_path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + ("\n" if lines else ""))
+            old.rename(self.data_dir / "searchlog.json.bak")
+        except Exception:
+            pass   # 迁移失败不影响软件运行，旧文件保留
+
+    def append_search_log(self, query: str, found: bool) -> SearchLog:
+        """追加一条搜索记录：单行写入、不读旧数据、多机并发互不覆盖。"""
+        rec = SearchLog(query=query.strip(), found=found, time=now_str())
+        self._rotate_searchlog_if_needed()
+        line = json.dumps(rec.to_dict(), ensure_ascii=False)
+        with open(self.searchlog_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        return rec
+
+    def _rotate_searchlog_if_needed(self) -> None:
+        """活动日志超限时归档改名（searchlog-<时间戳>.jsonl），新搜索写入新文件。"""
+        try:
+            if (self.searchlog_path.exists()
+                    and self.searchlog_path.stat().st_size > self.SEARCHLOG_ROTATE_BYTES):
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                os.replace(self.searchlog_path,
+                           self.data_dir / f"searchlog-{ts}.jsonl")
+        except OSError:
+            pass
+
+    def read_search_logs(self, limit: int = 500) -> list[SearchLog]:
+        """读取最近的记录（新→旧返回）。只解析日志尾部，记录总数再多也快。"""
+        path = self.searchlog_path
+        out: list[SearchLog] = []
+        if not path.exists():
+            return out
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return out
+        chunk = data[-self.SEARCHLOG_TAIL_BYTES:] if len(data) > self.SEARCHLOG_TAIL_BYTES else data
+        lines = chunk.decode("utf-8", errors="replace").splitlines()
+        if len(data) > self.SEARCHLOG_TAIL_BYTES and lines:
+            lines = lines[1:]   # 丢弃可能被截断的首行
+        for ln in reversed(lines):   # 文件顺序旧→新，倒序即新→旧
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                out.append(SearchLog.from_dict(json.loads(ln)))
+            except Exception:
+                continue
+            if len(out) >= limit:
+                break
+        return out
+
+    def count_search_logs(self) -> int:
+        """活动日志的总条数（按行数字节扫描，不解析 JSON）。"""
+        try:
+            n = 0
+            with open(self.searchlog_path, "rb") as f:
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    n += chunk.count(b"\n")
+            return n
+        except OSError:
+            return 0
+
+    def read_all_search_logs(self) -> list[SearchLog]:
+        """全量读取（含归档文件），旧→新。导出 Excel/CSV 时使用。"""
+        out: list[SearchLog] = []
+        for path in self._iter_searchlog_files():
+            for ln in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    out.append(SearchLog.from_dict(json.loads(ln)))
+                except Exception:
+                    continue
+        return out
+
+    def _rewrite_searchlog(self, records: list[SearchLog]) -> None:
+        """整份重写活动日志（仅删除/清空/挂截图等低频操作使用）。"""
+        self._rotate_searchlog_if_needed()
+        tmp = self.searchlog_path.with_name(self.searchlog_path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r.to_dict(), ensure_ascii=False) + "\n")
+        os.replace(tmp, self.searchlog_path)
+
+    def set_search_log_shot(self, log_id: str, src: Path) -> str:
+        """把报错截图复制进数据目录（统一扩展名），并把该条记录的 shot 字段写回日志。"""
+        shots_dir = self.data_dir / "shots"
+        shots_dir.mkdir(parents=True, exist_ok=True)
+        target = shots_dir / f"{log_id}{Path(src).suffix.lower() or '.png'}"
+        shutil.copyfile(src, target)
+        rel = f"shots/{target.name}"
+        recs = self.read_all_search_logs()
+        hit = False
+        for r in recs:
+            if r.id == log_id:
+                r.shot = rel
+                hit = True
+        if not hit:
+            raise OSError(f"搜索记录不存在：{log_id}")
+        self._rewrite_searchlog(recs)
+        return rel
+
+    def search_log_shot_path(self, log_id: str | SearchLog):
+        rec = log_id if isinstance(log_id, SearchLog) else None
+        shot = rec.shot if rec is not None else ""
+        if not shot:
+            for r in self.read_all_search_logs():
+                if r.id == log_id:
+                    shot = r.shot
+                    break
+        if not shot:
+            return None
+        p = self.data_dir / shot
+        return p if p.exists() else None
+
+    def delete_search_log(self, log_id: str) -> None:
+        """删除单条记录（从日志文件中移除该行）。"""
+        recs = self.read_all_search_logs()
+        kept = [r for r in recs if r.id != log_id]
+        self._rewrite_searchlog(kept)
+        shot_dir = self.data_dir / "shots"
+        for suffix in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
+            p = shot_dir / f"{log_id}{suffix}"
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+    def clear_search_logs(self) -> None:
+        """清空全部搜索记录（含归档与截图）。"""
+        self._rewrite_searchlog([])
+        for f in self.data_dir.glob("searchlog-*.jsonl"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        shutil.rmtree(self.data_dir / "shots", ignore_errors=True)
 
     def reload(self) -> None:
         """从磁盘重读全部数据（多机共享时拉取其他电脑的最新内容）。"""
@@ -339,14 +492,6 @@ class Store:
                          {"version": 1, "records": [f.to_dict() for f in self.feedback]},
                          indent=None)   # 紧凑存储：记录多时体积/读写都减半以上
         self._mark("feedback", self.feedback_path)
-
-    def save_search_logs(self) -> None:
-        if len(self.search_logs) > self.MAX_SEARCH_LOGS:
-            self.search_logs = self.search_logs[-self.MAX_SEARCH_LOGS:]
-        save_json_atomic(self.searchlog_path,
-                         {"version": 1, "records": [r.to_dict() for r in self.search_logs]},
-                         indent=None)   # 紧凑存储
-        self._mark("searchlog", self.searchlog_path)
 
     # ---------- SOP ----------
     def media_dir(self, sop_id: str) -> Path:
@@ -573,50 +718,6 @@ class Store:
         self.save_feedback()
 
     # ---------- 搜索记录 ----------
-    def add_search_log(self, query: str, found: bool) -> SearchLog:
-        """先读盘合并再追加：多台电脑同时搜索时，记录互相保留而不是整份覆盖。"""
-        self._load_search_logs(force=True)
-        rec = SearchLog(query=query.strip(), found=found, time=now_str())
-        self.search_logs.append(rec)
-        self.save_search_logs()
-        return rec
 
-    def set_search_log_shot(self, log_id: str, src: Path) -> str:
-        """把报错截图复制进数据目录（统一转存为 PNG 命名），返回相对路径。"""
-        self._load_search_logs(force=True)
-        rec = next((r for r in self.search_logs if r.id == log_id), None)
-        if rec is None:
-            raise OSError(f"搜索记录不存在：{log_id}")
-        shots_dir = self.data_dir / "shots"
-        shots_dir.mkdir(parents=True, exist_ok=True)
-        target = shots_dir / f"{log_id}{Path(src).suffix.lower() or '.png'}"
-        shutil.copyfile(src, target)
-        rec.shot = f"shots/{target.name}"
-        self.save_search_logs()
-        return rec.shot
 
-    def search_log_shot_path(self, rec: SearchLog) -> Path | None:
-        if not rec.shot:
-            return None
-        p = self.data_dir / rec.shot
-        return p if p.exists() else None
 
-    def delete_search_log(self, log_id: str) -> None:
-        self._load_search_logs(force=True)
-        self.search_logs = [r for r in self.search_logs if r.id != log_id]
-        self.save_search_logs()
-        # 一并清理对应截图
-        shot_dir = self.data_dir / "shots"
-        for suffix in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
-            p = shot_dir / f"{log_id}{suffix}"
-            if p.exists():
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
-
-    def clear_search_logs(self) -> None:
-        self._load_search_logs(force=True)
-        self.search_logs = []
-        self.save_search_logs()
-        shutil.rmtree(self.data_dir / "shots", ignore_errors=True)

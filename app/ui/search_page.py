@@ -292,9 +292,9 @@ class SearchPage(QWidget):
 
         self._results = search.search(self.store.sops, query)
         found = len(self._results) > 0
-        # 自动写入搜索记录（日期/时间/内容/是否找到）
+        # 自动写入搜索记录（JSONL 追加一行：多机并发安全，微秒级不卡搜索）
         try:
-            rec = self.store.add_search_log(query, found)
+            rec = self.store.append_search_log(query, found)
         except OSError:
             rec = None   # 共享盘暂不可写时不影响搜索本身
 
