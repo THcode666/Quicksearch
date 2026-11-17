@@ -45,6 +45,20 @@ def make_page(path: Path, title: str, lines: list[str]) -> None:
 
 def build_demo(data_dir: Path) -> Store:
     st = Store(data_dir)
+    # 烽火台截图文件提前生成（beacon upsert 会拷入其目录）
+    demo_shots = data_dir / "demo_shots"
+    demo_shots.mkdir(parents=True, exist_ok=True)
+    from PySide6.QtGui import QImage as _QImage
+    _s1 = demo_shots / "shot_01.png"
+    _img = _QImage(960, 640, _QImage.Format_RGB32)
+    _img.fill(QColor("#ffffff"))
+    _p = QPainter(_img)
+    _p.setPen(QColor("#c62828"))
+    _p.setFont(QFont("Microsoft YaHei", 26, QFont.Bold))
+    _p.drawText(_img.rect().adjusted(20, 20, -20, -20), int(Qt.AlignCenter),
+                "E4303 module not found 报警截图（演示）")
+    _p.end()
+    _img.save(str(_s1))
     demo = [
         ("E4303 module not found 处理流程", ["E4303"],
          "1. 重新插拔 module；\n2. 检查模块供电电压（DC24V）；\n3. 仍报警则更换备用模块并通知设备工程师。",
@@ -77,6 +91,23 @@ def build_demo(data_dir: Path) -> Store:
     st.append_search_log("430", True)
     st.append_search_log("E5201 chamber 门传感器异常", False)
     st.append_search_log("E4304", True)
+
+    from app.beacons import Beacon, BeaconStore
+    bs = BeaconStore(data_dir)
+    demo_beacons = [
+        Beacon(date="2026-11-17", machine="AL-07", recipe="RD07x",
+               test_od="OD2", probe_card="PC-88", probe_card_len="230um",
+               description="E4303 报警复现，重启后消失，换备用针卡后未再出现",
+               shots=["shot_01.png"]),
+        Beacon(date="2026-11-16", machine="AL-12", description="WF end 后 map 少检，待复判",
+               shots=[]),
+    ]
+    bs.upsert_beacon(demo_beacons[0], [_s1])   # 带截图
+    bs.upsert_beacon(demo_beacons[1], [])      # 无截图
+    from app.reportgen import generate_report
+    for b in bs.get_all():
+        paths = [bs.shot_path(b, i) for i in range(len(b.shots))]
+        generate_report(b, paths, bs.beacon_dir(b.id) / "report.html")
     return st
 
 
@@ -133,10 +164,14 @@ def main() -> int:
         win.show_page(2)
         win.feedback_page.refresh()
         snap("07_反馈记录")
-        # 08 搜索记录
+        # 08 烽火台
+        win.show_page(4)
+        win.beacon_page.refresh()
+        snap("08_烽火台")
+        # 09 搜索记录
         win.show_page(3)
         win.searchlog_page.refresh()
-        snap("08_搜索记录")
+        snap("09_搜索记录")
         # 09 设置
         from app.security import PasswordGate
         sd = SettingsDialog(PasswordGate(win.store.data_dir), cfg, win.store, win)

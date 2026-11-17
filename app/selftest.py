@@ -407,6 +407,62 @@ def test_pdf_convert() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------------- 烽火台（异常汇报 + 报告生成） ----------------
+def test_beacons() -> None:
+    from PySide6.QtGui import QImage
+    from app.beacons import BeaconStore
+    from app.reportgen import generate_report
+    tmp = Path(tempfile.mkdtemp(prefix="qs_beacon_"))
+    try:
+        bs = BeaconStore(tmp / "数据目录")
+        assert bs.get_all() == []
+
+        # 新建：日期、多字段
+        b = _Beacon(date="2026-11-17", machine="AL-07",
+                    recipe="RD07x", test_od="OD2",
+                    probe_card="PC-88", probe_card_len="230um",
+                    description="E4303 反复报警，重启后消失")
+        bs.upsert_beacon(b, [])
+        got = bs.get_beacon(b.id)
+        assert got and got.machine == "AL-07" and got.date == "2026-11-17"
+
+        # 截图管理：保存两张 → 删一张 → 剩一张且文件正确
+        img1 = tmp / "截图A.png"
+        img2 = tmp / "截图B.jpg"
+        QImage(320, 240, QImage.Format_RGB32).save(str(img1))
+        QImage(200, 200, QImage.Format_RGB32).save(str(img2))
+        bs.upsert_beacon(b, [img1, img2])
+        assert len(b.shots) == 2
+        assert bs.shot_path(b, 0).exists() and bs.shot_path(b, 1).exists()
+        bs.upsert_beacon(b, [img1])
+        assert b.shots == ["shot_01.png"] and bs.shot_path(b, 0).exists()
+        assert not bs.beacon_dir(b.id).joinpath("shot_02.jpg").exists(), "移除的截图应被清理"
+
+        # 编辑：另一台电脑（新实例）写入后，本机编辑不覆盖他机记录
+        other = BeaconStore(tmp / "数据目录")
+        other_b = _Beacon(date="2026-11-16", machine="AL-08", description="他机记录的异常")
+        other.upsert_beacon(other_b, [])
+        b.description = "更新：更换针卡后恢复正常"
+        bs.upsert_beacon(b)
+        chk = BeaconStore(tmp / "数据目录")
+        assert len(chk.get_all()) == 2, "他机记录不应被覆盖"
+
+        # 报告生成：包含各字段 + 截图内嵌
+        out = chk.beacon_dir(b.id) / "report.html"
+        generate_report(b, [chk.shot_path(b, 0)], out)
+        html = out.read_text(encoding="utf-8")
+        for kw in ("2026-11-17", "AL-07", "RD07x", "OD2", "PC-88", "230um",
+                   "更换针卡后恢复正常", "data:image/png;base64"):
+            assert kw in html, f"报告缺少内容：{kw}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _Beacon(**kw):
+    from app.beacons import Beacon
+    return Beacon(**kw)
+
+
 # ---------------- 性能规模测试（3000 条 SOP） ----------------
 def test_scale_performance() -> None:
     import time
@@ -748,6 +804,7 @@ def run_all(include_ui: bool = True) -> int:
     _case("PPT转换降级", test_converter_graceful)
     _case("PDF导入", test_pdf_convert)
     _case("密码保护", test_password_gate)
+    _case("烽火台", test_beacons)
     if include_ui:
         _case("图标绘制", test_icons)
         _case("界面冒烟测试", test_ui_smoke)

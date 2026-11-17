@@ -17,7 +17,7 @@ import tempfile
 from pathlib import Path
 
 APP_NAME = "Quicksearch"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 APP_TITLE = "Quicksearch — SOP 快速查找"
 
 

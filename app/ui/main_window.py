@@ -9,9 +9,11 @@ from PySide6.QtWidgets import (QButtonGroup, QDialog, QFrame, QHBoxLayout,
                                QLabel, QMainWindow, QPushButton,
                                QStackedWidget, QVBoxLayout, QWidget)
 
+from app.beacons import BeaconStore
 from app.config import APP_TITLE, APP_VERSION, Config
 from app.security import PasswordGate
 from app.store import Store
+from .beacon_page import BeaconPage
 from .feedback_page import FeedbackPage
 from .library_page import LibraryPage
 from .search_page import SearchPage
@@ -27,6 +29,7 @@ class MainWindow(QMainWindow):
         self.cfg = cfg or Config()
         data_dir = Path(data_dir_override) if data_dir_override else self.cfg.resolve_data_dir()
         self.store = Store(data_dir)
+        self.beacon_store = BeaconStore(data_dir)
         self.pwd_gate = PasswordGate(data_dir)
         self._library_unlocked = False   # 离开 SOP 库页面即重新上锁
 
@@ -56,14 +59,18 @@ class MainWindow(QMainWindow):
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
         self.nav_buttons: list[QPushButton] = []
-        for text, page_idx in (("🔍  快速查找", 0), ("📚  SOP 库", 1),
-                               ("📝  反馈记录", 2), ("🕘  搜索记录", 3)):
+        self._nav_btn_by_page: dict[int, QPushButton] = {}
+        # 显示顺序与栈索引解耦：烽火台显示在第二位，但对应栈页 index 4
+        for text, page_idx in (("🔍  快速查找", 0), ("🔥  烽火台", 4),
+                               ("📚  SOP 库", 1), ("📝  反馈记录", 2),
+                               ("🕘  搜索记录", 3)):
             btn = QPushButton(text)
             btn.setObjectName("NavButton")
             btn.setCheckable(True)
             btn.setCursor(Qt.PointingHandCursor)
             self.nav_group.addButton(btn)
             self.nav_buttons.append(btn)
+            self._nav_btn_by_page[page_idx] = btn
             nav_lay.addWidget(btn)
         self.nav_buttons[0].setChecked(True)
         nav_lay.addStretch(1)
@@ -86,9 +93,10 @@ class MainWindow(QMainWindow):
         self.library_page = LibraryPage(self.store, self.cfg)
         self.feedback_page = FeedbackPage(self.store)
         self.searchlog_page = SearchLogPage(self.store)
+        self.beacon_page = BeaconPage(self.beacon_store)
         self.viewer_page = ViewerPage(self.store)
         for p in (self.search_page, self.library_page, self.feedback_page,
-                  self.searchlog_page, self.viewer_page):
+                  self.searchlog_page, self.beacon_page, self.viewer_page):
             self.stack.addWidget(p)
         lay.addWidget(self.stack, 1)
         self.setCentralWidget(central)
@@ -97,8 +105,8 @@ class MainWindow(QMainWindow):
         self.search_page.open_sop.connect(self.open_sop)
         self.library_page.open_sop.connect(self.open_sop)
         self.viewer_page.back_requested.connect(self._back_from_viewer)
-        for i, btn in enumerate(self.nav_buttons):
-            btn.clicked.connect(lambda _=False, idx=i: self.show_page(idx))
+        for page_idx, btn in self._nav_btn_by_page.items():
+            btn.clicked.connect(lambda _=False, idx=page_idx: self.show_page(idx))
 
         sc = QShortcut(QKeySequence("Ctrl+F"), self)
         sc.activated.connect(self._focus_search)
@@ -138,9 +146,9 @@ class MainWindow(QMainWindow):
 
     def _sync_nav_selection(self) -> None:
         """导航按钮选中状态与当前实际页面保持一致（密码取消时回退）。"""
-        idx = self.stack.currentIndex()
-        for i, btn in enumerate(self.nav_buttons):
-            btn.setChecked(i == idx)
+        cur = self.stack.currentIndex()
+        for page_idx, btn in self._nav_btn_by_page.items():
+            btn.setChecked(page_idx == cur)
 
     def show_page(self, index: int) -> None:
         """index: 0查找 1库 2反馈 3搜索记录。SOP 库需密码解锁，离开即重新上锁。"""
@@ -167,7 +175,7 @@ class MainWindow(QMainWindow):
         return self.stack.indexOf(w) if w is not self.viewer_page else self._prev_page_index
 
     def _back_from_viewer(self) -> None:
-        idx = self._prev_page_index if 0 <= self._prev_page_index <= 3 else 0
+        idx = self._prev_page_index if 0 <= self._prev_page_index <= 4 else 0
         self._reload_store()
         self.stack.setCurrentIndex(idx)
         widget = self.stack.widget(idx)
@@ -202,12 +210,14 @@ class MainWindow(QMainWindow):
         """切换数据目录（共享部署时使用），所有页面重新加载数据。
         密码跟随数据目录，切换后重新上锁。"""
         self.store = Store(new_dir)
+        self.beacon_store = BeaconStore(new_dir)
         self.pwd_gate = PasswordGate(new_dir)
         self._library_unlocked = False
         self.search_page.set_store(self.store)
         self.library_page.set_store(self.store)
         self.feedback_page.set_store(self.store)
         self.searchlog_page.set_store(self.store)
+        self.beacon_page.set_store(self.beacon_store)
         self.viewer_page.store = self.store
         self.viewer_page.clear()
         self._update_statusbar()
