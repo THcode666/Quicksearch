@@ -94,7 +94,7 @@ class BeaconDialog(QDialog):
         mid.addWidget(self.shot_list)
         right = QVBoxLayout()
         self.preview = QLabel("选择左侧截图可预览")
-        self.preview.setAlignment(int(Qt.AlignCenter))
+        self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumSize(300, 200)
         self.preview.setStyleSheet(
             "background:#f4f6fa; border:1px solid #d9e0ea; border-radius:10px; color:#8a97ac;")

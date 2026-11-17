@@ -168,6 +168,14 @@ def main() -> int:
         win.show_page(4)
         win.beacon_page.refresh()
         snap("08_烽火台")
+        # 10 新建异常汇报弹窗（实拍验证弹窗可正常构建显示）
+        from app.ui.beacon_dialog import BeaconDialog
+        bdlg = BeaconDialog(win.beacon_store, None, parent=win)
+        bdlg.resize(760, 640)
+        bdlg.show()
+        app.processEvents()
+        snap("10_新建异常汇报", bdlg)
+        bdlg.close()
         # 09 搜索记录
         win.show_page(3)
         win.searchlog_page.refresh()

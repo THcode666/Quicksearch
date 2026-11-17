@@ -758,6 +758,48 @@ def test_ui_smoke() -> None:
             "恢复后应回到 SOP 库且回收站清空该条"
         td.deleteLater()
 
+        # 烽火台：新建对话框全流程（填字段/贴截图/保存）→ 记录+截图+报告齐全
+        from app.ui.beacon_dialog import BeaconDialog
+        bd = BeaconDialog(win.beacon_store, None, parent=win)
+        assert bd.date_edit.date().toString("yyyy-MM-dd") != "", "日期应自动填当前日期"
+        bd.machine_edit.setText("AL-07")
+        bd.recipe_edit.setText("RD07x")
+        bd.test_od_edit.setText("OD2")
+        bd.probe_card_edit.setText("PC-88")
+        bd.probe_len_edit.setText("230um")
+        bd.desc_edit.setPlainText("E4303 报警复现，换针卡后恢复")
+        img1 = QImage(400, 300, QImage.Format_RGB32)
+        img1.fill(QColor("#eef4ff"))
+        img2 = QImage(300, 200, QImage.Format_RGB32)
+        img2.fill(QColor("#fff4e5"))
+        bd._add_shot_object(img1)
+        bd._add_shot_object(img2)
+        assert len(bd._shots) == 2, "两张截图应入列"
+        bd._save()
+        assert bd.saved_id, "保存应成功并生成报告"
+        bchk = win.beacon_store.get_beacon(bd.saved_id)
+        assert bchk.machine == "AL-07" and len(bchk.shots) == 2
+        assert win.beacon_store.shot_path(bchk, 0).exists()
+        assert win.beacon_store.shot_path(bchk, 1).exists()
+        report = win.beacon_store.beacon_dir(bchk.id) / "report.html"
+        assert report.exists(), "保存应自动生成报告"
+        html = report.read_text(encoding="utf-8")
+        for kw in ("AL-07", "RD07x", "OD2", "PC-88", "230um", "E4303 报警复现", "data:image/png;base64"):
+            assert kw in html, f"报告缺少内容：{kw}"
+        # 编辑：移除一张截图再保存 → 截图与报告同步更新
+        bd2 = BeaconDialog(win.beacon_store, bchk, parent=win)
+        assert len(bd2._shots) == 2
+        bd2._remove_shot()
+        bd2.desc_edit.setPlainText("更新：已回退 recipe 并复测")
+        bd2._save()
+        bchk2 = win.beacon_store.get_beacon(bchk.id)
+        assert len(bchk2.shots) == 1, "移除的截图应被清理"
+        assert not win.beacon_store.beacon_dir(bchk2.id).joinpath("shot_02.jpg").exists(),             "移除的截图文件应被删除"
+        # 删除 → 记录与目录一并清理
+        assert win.beacon_store.delete_beacon(bchk2.id)
+        assert win.beacon_store.get_beacon(bchk2.id) is None
+        assert not win.beacon_store.beacon_dir(bchk2.id).exists()
+
         # 版本对话框：保存过的 SOP 应有版本记录，可选中
         from app.ui.versions_dialog import VersionsDialog
         cur = store.get_sop(sop.id)
